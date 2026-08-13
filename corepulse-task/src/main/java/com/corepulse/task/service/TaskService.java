@@ -1,47 +1,78 @@
 package com.corepulse.task.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.corepulse.common.constant.MqConstants;
 import com.corepulse.common.constant.RedisKeys;
 import com.corepulse.common.exception.BizException;
 import com.corepulse.common.result.ResultCode;
 import com.corepulse.domain.entity.ToolTask;
 import com.corepulse.domain.enums.TaskStatus;
 import com.corepulse.domain.vo.TaskVO;
+import com.corepulse.task.executor.ToolTaskExecutor;
 import com.corepulse.task.mapper.ToolTaskMapper;
-import com.corepulse.task.mq.TaskMessage;
-import com.corepulse.task.mq.TaskProducer;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
- * 任务服务: 创建/下发/查询/确认 —— 任务状态机核心
+ * 任务服务: 创建/执行/查询/确认 —— 任务状态机核心
+ * <p>
+ * 使用 JVM 内置的 ScheduledExecutorService 实现延时终止，
+ * 不依赖外部 RabbitMQ，适合直接运行在用户本机的场景。
  */
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class TaskService {
 
+    /** 各任务类型的执行器（taskType -> executor） */
+    private final Map<String, ToolTaskExecutor> executorMap;
     private final ToolTaskMapper taskMapper;
-    private final TaskProducer producer;
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
 
-    /** 创建任务并下发 MQ(立即执行 + 延时终止两条消息) */
+    /** JVM 内置延时调度器：用于任务超时自动终止 */
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+    /** 已调度的延时终止任务（taskId -> future），用于取消 */
+    private final Map<Long, ScheduledFuture<?>> timeoutTasks = new java.util.concurrent.ConcurrentHashMap<>();
+
+    public TaskService(List<ToolTaskExecutor> executors,
+                       ToolTaskMapper taskMapper,
+                       StringRedisTemplate redisTemplate,
+                       ObjectMapper objectMapper) {
+        Map<String, ToolTaskExecutor> map = new HashMap<>();
+        for (ToolTaskExecutor executor : executors) {
+            map.put(executor.taskType(), executor);
+        }
+        this.executorMap = map;
+        this.taskMapper = taskMapper;
+        this.redisTemplate = redisTemplate;
+        this.objectMapper = objectMapper;
+        log.info("任务执行器已注册: {}", executorMap.keySet());
+    }
+
+    /** 创建任务并执行(立即执行 + JVM 延时自动终止) */
     public ToolTask startTask(String taskType, Map<String, Object> params, Long sessionId) {
         Long running = taskMapper.selectCount(new LambdaQueryWrapper<ToolTask>()
                 .eq(ToolTask::getTaskType, taskType)
                 .in(ToolTask::getStatus, List.of(TaskStatus.CREATED.name(), TaskStatus.RUNNING.name())));
         if (running > 0) {
             throw new BizException(ResultCode.TASK_STATE_ERROR, "已有进行中的 " + taskType + " 任务, 请先停止");
+        }
+
+        // 校验执行器存在
+        ToolTaskExecutor executor = executorMap.get(taskType);
+        if (executor == null) {
+            throw new BizException(ResultCode.BAD_REQUEST, "无执行器处理任务类型: " + taskType);
         }
 
         ToolTask task = new ToolTask();
@@ -52,24 +83,31 @@ public class TaskService {
         task.setParams(toJson(params));
         taskMapper.insert(task);
 
-        TaskMessage execute = new TaskMessage();
-        execute.setTaskId(task.getId());
-        execute.setMsgType(MqConstants.MSG_TYPE_EXECUTE);
-        execute.setTaskType(taskType);
-        execute.setSessionId(sessionId);
-        execute.setParams(params);
-        producer.sendExecute(execute);
+        // 立即执行
+        try {
+            executor.start(task.getId());
+        } catch (Exception e) {
+            log.error("任务启动失败: taskId={}", task.getId(), e);
+            task.setStatus(TaskStatus.FAILED.name());
+            task.setErrorMsg(e.getMessage());
+            task.setFinishedAt(LocalDateTime.now());
+            taskMapper.updateById(task);
+            throw new BizException(ResultCode.TOOL_ERROR, "任务启动失败: " + e.getMessage());
+        }
 
-        // 延时终止(死信队列)
+        // JVM 延时自动终止（替代 RabbitMQ 死信队列）
         int durationMin = params.get("durationMin") instanceof Number n ? n.intValue() : 30;
-        TaskMessage timeout = new TaskMessage();
-        timeout.setTaskId(task.getId());
-        timeout.setMsgType(MqConstants.MSG_TYPE_TIMEOUT);
-        timeout.setTaskType(taskType);
-        timeout.setSessionId(sessionId);
-        producer.sendDelayTimeout(timeout, durationMin * 60_000L);
+        Long taskId = task.getId();
+        ScheduledFuture<?> future = scheduler.schedule(
+                () -> {
+                    log.info("任务超时自动终止: taskId={}, type={}", taskId, taskType);
+                    executor.stop(taskId, TaskStatus.TIMEOUT);
+                    timeoutTasks.remove(taskId);
+                },
+                durationMin, TimeUnit.MINUTES);
+        timeoutTasks.put(taskId, future);
 
-        log.info("任务已创建并下发: taskId={}, type={}, durationMin={}", task.getId(), taskType, durationMin);
+        log.info("任务已创建并执行: taskId={}, type={}, durationMin={}", taskId, taskType, durationMin);
         return task;
     }
 
@@ -79,11 +117,15 @@ public class TaskService {
         if (!List.of(TaskStatus.CREATED.name(), TaskStatus.RUNNING.name()).contains(task.getStatus())) {
             throw new BizException(ResultCode.TASK_STATE_ERROR, "任务已结束, 无法停止");
         }
-        TaskMessage stop = new TaskMessage();
-        stop.setTaskId(taskId);
-        stop.setTaskType(task.getTaskType());
-        stop.setSessionId(task.getSessionId());
-        producer.sendStop(stop);
+        // 取消已调度的延时终止
+        ScheduledFuture<?> future = timeoutTasks.remove(taskId);
+        if (future != null) {
+            future.cancel(false);
+        }
+        ToolTaskExecutor executor = executorMap.get(task.getTaskType());
+        if (executor != null) {
+            executor.stop(taskId, TaskStatus.CANCELLED);
+        }
     }
 
     public ToolTask getTaskOrThrow(Long taskId) {
@@ -139,12 +181,11 @@ public class TaskService {
         if (approved) {
             task.setStatus(TaskStatus.RUNNING.name());
             taskMapper.updateById(task);
-            TaskMessage confirm = new TaskMessage();
-            confirm.setTaskId(taskId);
-            confirm.setMsgType(MqConstants.MSG_TYPE_CONFIRM);
-            confirm.setTaskType(task.getTaskType());
-            confirm.setSessionId(task.getSessionId());
-            producer.sendExecute(confirm);
+            // 确认后重启执行器（预留 M3 实际执行逻辑）
+            ToolTaskExecutor executor = executorMap.get(task.getTaskType());
+            if (executor != null) {
+                executor.start(taskId);
+            }
         } else {
             task.setStatus(TaskStatus.CANCELLED.name());
             task.setFinishedAt(LocalDateTime.now());

@@ -23,6 +23,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 /**
  * AI 对话编排服务实现 - 基于 Spring AI ChatClient
@@ -70,11 +71,12 @@ public class ChatServiceImpl implements ChatService {
         // 4. 构建上下文消息
         List<Message> messages = buildMessages(session.getId());
 
-        // 5. 调用 LLM
+        // 5. 调用 LLM（注入工具上下文：sessionId 供工具方法使用，不暴露给 LLM 参数）
         String reply;
         try {
             reply = chatClient.prompt()
                     .messages(messages)
+                    .toolContext(Map.of("sessionId", session.getId()))
                     .call()
                     .content();
         } catch (Exception e) {

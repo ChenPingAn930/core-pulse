@@ -1,6 +1,7 @@
 package com.corepulse.task.executor;
 
 import com.corepulse.common.constant.RedisKeys;
+import com.corepulse.common.process.ProcessManager;
 import com.corepulse.domain.entity.TaskMetric;
 import com.corepulse.domain.entity.ToolTask;
 import com.corepulse.domain.enums.TaskStatus;
@@ -115,6 +116,10 @@ public class FurMarkTaskExecutor implements ToolTaskExecutor {
         if (future != null) {
             future.cancel(false);
         }
+
+        // 终止真实 FurMark 进程（由工具启动并注册到 ProcessManager）
+        ProcessManager.kill(taskId);
+
         ToolTask task = taskMapper.selectById(taskId);
         if (task == null || !TaskStatus.RUNNING.name().equals(task.getStatus())) {
             return;
@@ -122,10 +127,8 @@ public class FurMarkTaskExecutor implements ToolTaskExecutor {
 
         // 汇总结果(M1 模拟)
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("peakTemp", 79.0);
-        result.put("avgFps", 90);
         result.put("durationSec", task.getProgress() == null ? 0 : task.getProgress());
-        result.put("conclusion", "显卡运行稳定, 峰值温度正常, 未出现降频。");
+        result.put("conclusion", "显卡烤机已结束。");
         task.setStatus(finalStatus.name());
         task.setResult(toJson(result));
         task.setFinishedAt(LocalDateTime.now());
