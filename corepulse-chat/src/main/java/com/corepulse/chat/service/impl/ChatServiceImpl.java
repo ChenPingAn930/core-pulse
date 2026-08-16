@@ -2,9 +2,11 @@ package com.corepulse.chat.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.corepulse.chat.Enum.PromptEnum;
+import com.corepulse.chat.Enum.ReinstallGuideEnum;
 import com.corepulse.chat.mapper.ChatMessageMapper;
 import com.corepulse.chat.model.dto.ChatSendRequest;
 import com.corepulse.chat.model.vo.ChatSendVO;
+import com.corepulse.chat.rag.KnowledgeService;
 import com.corepulse.chat.service.ChatService;
 import com.corepulse.chat.service.SessionService;
 import com.corepulse.domain.entity.ChatMessage;
@@ -40,6 +42,7 @@ public class ChatServiceImpl implements ChatService {
     private final ChatClient chatClient;
     private final SessionService sessionService;
     private final ChatMessageMapper messageMapper;
+    private final KnowledgeService knowledgeService;
 
     /**
      * 发送消息 - AI 对话核心流程
@@ -68,20 +71,39 @@ public class ChatServiceImpl implements ChatService {
         // 3. 保存用户消息
         saveMessage(session.getId(), MessageRole.USER.getValue(), content, null, null);
 
-        // 4. 构建上下文消息
-        List<Message> messages = buildMessages(session.getId());
+        // 4. 构建上下文消息（传入用户消息用于重装意图检测）
+        List<Message> messages = buildMessages(session.getId(), content);
 
         // 5. 调用 LLM（注入工具上下文：sessionId 供工具方法使用，不暴露给 LLM 参数）
         String reply;
+        java.util.List<String> invokedTools = new java.util.ArrayList<>();
         try {
-            reply = chatClient.prompt()
+            org.springframework.ai.chat.model.ChatResponse chatResponse = chatClient.prompt()
                     .messages(messages)
                     .toolContext(Map.of("sessionId", session.getId()))
                     .call()
-                    .content();
+                    .chatResponse();
+
+            // 记录本次回复所基于的工具调用（工具调用信息在 AssistantMessage 的 toolCalls 中）
+            chatResponse.getResults().forEach(result -> {
+                org.springframework.ai.chat.messages.AssistantMessage output = result.getOutput();
+                if (output != null && output.getToolCalls() != null) {
+                    output.getToolCalls().forEach(tc -> invokedTools.add(tc.name()));
+                }
+            });
+
+            reply = chatResponse.getResult() != null ? chatResponse.getResult().getOutput().getText() : null;
         } catch (Exception e) {
             log.error("LLM 调用失败: sessionId={}", session.getId(), e);
             reply = "抱歉，AI 服务暂时不可用，请稍后重试。";
+        }
+
+        // 记录最终回复这一轮是否还有工具调用
+        // 说明：多轮工具调用发生在 chatClient 内部循环中，最终 chatResponse 通常是 LLM 直接输出文字的那一轮
+        if (!invokedTools.isEmpty()) {
+            log.info("会话 {} 最终回复轮次仍触发了工具调用: tools={}", session.getId(), invokedTools);
+        } else {
+            log.info("会话 {} 最终回复由 LLM 直接生成文字（工具调用可能发生在更早轮次，见各工具日志）", session.getId());
         }
 
         if (reply == null || reply.isBlank()) {
@@ -99,20 +121,42 @@ public class ChatServiceImpl implements ChatService {
                 .build();
     }
 
+    /** 重装系统意图关键词（命中则注入重装引导） */
+    private static final List<String> REINSTALL_KEYWORDS = List.of(
+            "重装系统", "装系统", "重装", "系统盘", "安装系统", "制作u盘",
+            "制作U盘", "启动盘", "安装u盘", "重做系统", "重灌系统"
+    );
+
     /**
      * 构建发送给 LLM 的消息列表
      * <p>
      * 组装顺序：系统提示词 + 该会话最近 N 条历史消息（按时间正序）+ 当前用户消息。
      * 其中 system / tool 类型的消息不纳入上下文，避免干扰模型理解。
+     * <p>
+     * 若用户消息命中「重装系统」意图，则额外注入重装系统图文引导（ReinstallGuideEnum），
+     * 让 LLM 按标准流程引导用户，同时不影响日常对话。
      *
      * @param sessionId 会话 ID，用于查询该会话的历史消息
+     * @param userContent 当前用户消息内容，用于意图检测
      * @return 组装好的 Spring AI Message 列表
      */
-    private List<Message> buildMessages(Long sessionId) {
+    private List<Message> buildMessages(Long sessionId, String userContent) {
         List<Message> messages = new ArrayList<>();
 
         // 系统提示
         messages.add(new SystemMessage(PromptEnum.SYSTEM_DEFAULT.getContent()));
+
+        // RAG：检索个人知识库，命中则注入相关知识片段，辅助诊断
+        // topK=5 提高硬件操作细节(如 4.1 内存拔插)被命中的概率，避免只命中概览块而丢失安全细节
+        List<String> knowledge = knowledgeService.search(userContent, 5);
+        if (!knowledge.isEmpty()) {
+            messages.add(new SystemMessage(buildKnowledgePrompt(knowledge)));
+        }
+
+        // 重装系统意图检测：命中则注入图文引导
+        if (hasReinstallIntent(userContent)) {
+            messages.add(new SystemMessage(buildReinstallGuide()));
+        }
 
         // 历史消息（最近 MAX_HISTORY 条，按 ID 正序）
         List<ChatMessage> history = messageMapper.selectList(
@@ -152,5 +196,67 @@ public class ChatServiceImpl implements ChatService {
         msg.setToolName(toolName);
         msg.setTaskId(taskId);
         messageMapper.insert(msg);
+    }
+
+    /**
+     * 检测用户消息是否命中「重装系统」意图
+     *
+     * @param content 用户消息内容
+     * @return 是否命中
+     */
+    private boolean hasReinstallIntent(String content) {
+        if (content == null || content.isBlank()) {
+            return false;
+        }
+        String lower = content.toLowerCase();
+        return REINSTALL_KEYWORDS.stream().anyMatch(lower::contains);
+    }
+
+    /**
+     * 组装重装系统图文引导内容
+     * <p>
+     * 将 ReinstallGuideEnum 各阶段按执行顺序拼接，作为一条系统消息注入，
+     * 引导 LLM 按标准流程输出。
+     *
+     * @return 重装系统引导文本
+     */
+    private String buildReinstallGuide() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("【重装系统专用引导】用户当前有重装系统的需求。请严格按照以下流程引导用户，")
+                .append("每一步完成确认后再进入下一步，不要跳步，不要代替用户执行任何危险操作。\n\n");
+        sb.append(ReinstallGuideEnum.ENV_CHECK.getContent()).append("\n\n");
+        sb.append(ReinstallGuideEnum.BACKUP_REMIND.getContent()).append("\n\n");
+        sb.append(ReinstallGuideEnum.DOWNLOAD_MCT.getContent()).append("\n\n");
+        sb.append(ReinstallGuideEnum.MAKE_USB_GUIDE.getContent()).append("\n\n");
+        sb.append(ReinstallGuideEnum.INSTALL_GUIDE.getContent());
+        return sb.toString();
+    }
+
+    /**
+     * 组装知识库检索结果的系统提示
+     * <p>
+     * 将 RAG 命中片段包装为系统消息，要求 LLM 优先参考知识库内容回答，
+     * 并强调知识库可能不完整，避免模型编造知识库中不存在的信息。
+     *
+     * @param knowledge 命中的知识片段列表
+     * @return 可注入的系统提示文本
+     */
+    private String buildKnowledgePrompt(List<String> knowledge) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("【维修知识库参考】以下是从本地维修知识库检索到的相关资料。你必须严格遵守以下规则：\n")
+                .append("1. 优先依据这些资料回答，回答要专业、准确、通俗易懂。\n")
+                .append("2. 凡涉及硬件插拔、拆机、断电、短路等操作，必须【完整、逐字】保留知识库中给出的安全操作细节，")
+                .append("例如「按下内存插槽两端的卡扣拔出内存」「断电后打开机箱」「释放残余电量」「橡皮擦擦拭金手指」「听到卡哒声即安装到位」「佩戴防静电手环」等，")
+                .append("严禁省略、简化或自己概括这些关键动作。\n")
+                .append("3. 【风险警告必须转述，这是最高优先级】：知识库中出现的任何以「⚠️ 风险警告」「风险警告」开头的段落，")
+                .append("你必须【在向用户给出任何对应操作步骤的同时，把该风险警告的内容完整、逐字转述给用户】，")
+                .append("例如「必须先拔掉电源线并长按开机键10秒释放残余电量」「建议佩戴防静电手环或先触摸金属物体释放静电」「切勿带电操作」「开箱可能使保修失效」等。")
+                .append("不得省略、不得只在末尾一笔带过、不得只提示而不给具体内容。\n")
+                .append("4. 知识库明确标注为「进阶操作」或「高风险」的步骤，必须在回答中同步提示风险，并提醒用户量力而行、必要时送修。\n")
+                .append("5. 不要臆造知识库中不存在的操作步骤；若知识库未覆盖用户问题，则用通用知识谨慎回答并说明这是通用建议。\n\n");
+        for (String k : knowledge) {
+            sb.append("------\n").append(k).append("\n");
+        }
+        return sb.toString();
     }
 }

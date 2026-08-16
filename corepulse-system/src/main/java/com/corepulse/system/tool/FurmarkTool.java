@@ -67,6 +67,7 @@ public class FurmarkTool implements SystemTool {
         Long sessionId = toolContext != null
                 ? (Long) toolContext.getContext().get("sessionId")
                 : null;
+        log.info("调用工具: startFurMark，开始启动显卡烤机，时长={}分钟", minutes);
         File exe = new File(furmarkExePath);
 
         // 1. 启动真实 FurMark.exe 进程（绕过 start.bat 的 pause）

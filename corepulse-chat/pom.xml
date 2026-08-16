@@ -27,10 +27,16 @@
             <version>0.1.0-SNAPSHOT</version>
         </dependency>
 
-        <!-- Spring AI OpenAI Starter (兼容 DeepSeek) -->
+        <!-- Spring AI OpenAI Starter (兼容 DeepSeek / 阿里百炼) -->
         <dependency>
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-starter-model-openai</artifactId>
+        </dependency>
+
+        <!-- Spring AI 本地向量存储 (SimpleVectorStore) + 向量存储抽象 -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-vector-store</artifactId>
         </dependency>
 
         <dependency>

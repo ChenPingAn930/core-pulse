@@ -68,4 +68,61 @@ public final class ProcessManager {
         Process process = PROCESS_MAP.get(taskId);
         return process != null && process.isAlive();
     }
+
+    /**
+     * 判断该任务类型是否支持进程存活检测
+     * <p>
+     * 仅"后台持续进程"类任务（如 furmark 烤机）支持，因为此类任务启动后会持续运行，
+     * 可通过进程存活状态判断任务是否真的在进行。
+     * agent_task 等同步执行的任务不支持（进程生命周期不同）。
+     *
+     * @param taskType 任务类型
+     * @return true 支持进程检测
+     */
+    public static boolean isSupported(String taskType) {
+        return "furmark".equals(taskType) || "cpustress".equals(taskType) || "memstress".equals(taskType);
+    }
+
+    /**
+     * 判断指定任务是否真的还在运行
+     * <p>
+     * 通过系统命令 tasklist 检测进程是否存在，比 Java 的 Process.isAlive() 更可靠
+     * （用户手动结束进程后，Java 持有的 Process 对象可能仍误判为存活）。
+     *
+     * @param taskId 任务 ID
+     * @return true 进程仍在运行
+     */
+    public static boolean isTaskRunning(Long taskId) {
+        Process process = PROCESS_MAP.get(taskId);
+        if (process == null) {
+            return false;
+        }
+        // 先尝试 Java 判断，若明确已死则直接返回
+        if (!process.isAlive()) {
+            return false;
+        }
+        // 用系统命令复核（避免 Java 对象状态滞后）
+        return isProcessRunningByTasklist(process);
+    }
+
+    /**
+     * 判断指定的 Java 进程句柄对应的真实进程是否存活
+     * <p>
+     * 通过 tasklist 按 PID 检测。
+     */
+    private static boolean isProcessRunningByTasklist(Process process) {
+        try {
+            long pid = process.pid();
+            ProcessBuilder pb = new ProcessBuilder("tasklist", "/fi", "pid eq " + pid);
+            pb.redirectErrorStream(true);
+            Process cmd = pb.start();
+            String output = new String(cmd.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            cmd.waitFor();
+            // 输出中包含 PID 行则说明进程存在
+            return output.contains(String.valueOf(pid)) && !output.contains("没有运行的任务");
+        } catch (Exception e) {
+            log.warn("tasklist 检测进程失败, 回退到 Java 判断", e);
+            return process.isAlive();
+        }
+    }
 }

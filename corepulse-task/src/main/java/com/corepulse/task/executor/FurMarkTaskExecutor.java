@@ -44,6 +44,8 @@ public class FurMarkTaskExecutor implements ToolTaskExecutor {
 
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
     private final Map<Long, ScheduledFuture<?>> runningTasks = new ConcurrentHashMap<>();
+    /** taskId -> sessionId，用于 tick 推送进度时定位会话（避免每秒查库） */
+    private final Map<Long, Long> taskSessions = new ConcurrentHashMap<>();
 
     @Override
     public String taskType() {
@@ -59,6 +61,9 @@ public class FurMarkTaskExecutor implements ToolTaskExecutor {
         task.setStatus(TaskStatus.RUNNING.name());
         task.setStartedAt(LocalDateTime.now());
         taskMapper.updateById(task);
+
+        // 缓存 sessionId，供 tick 推送进度用
+        taskSessions.put(taskId, task.getSessionId());
 
         int durationSec = parseDurationSec(task);
         AtomicInteger elapsed = new AtomicInteger(0);
@@ -80,13 +85,7 @@ public class FurMarkTaskExecutor implements ToolTaskExecutor {
         metric.put("gpuFps", gpuFps);
         metric.put("elapsedSec", sec);
 
-        ToolTask task = taskMapper.selectById(taskId);
-        if (task == null) {
-            return;
-        }
-        task.setProgress(progress);
-        taskMapper.updateById(task);
-
+        // 进度等实时数据只写 Redis + WebSocket 推送，不落数据库（避免高频写库）
         try {
             redisTemplate.opsForValue().set(RedisKeys.taskMetric(taskId),
                     objectMapper.writeValueAsString(metric));
@@ -94,8 +93,13 @@ public class FurMarkTaskExecutor implements ToolTaskExecutor {
             log.warn("写 Redis 指标失败: {}", e.getMessage());
         }
 
-        eventPublisher.publishProgress(task.getSessionId(), taskId, metric);
+        // WebSocket 推送实时进度
+        Long sessionId = taskSessions.get(taskId);
+        if (sessionId != null) {
+            eventPublisher.publishProgress(sessionId, taskId, metric);
+        }
 
+        // 每 5 秒采样落库一次历史指标（低频，用于最终报告）
         if (sec % 5 == 0) {
             TaskMetric m = new TaskMetric();
             m.setTaskId(taskId);
@@ -116,6 +120,8 @@ public class FurMarkTaskExecutor implements ToolTaskExecutor {
         if (future != null) {
             future.cancel(false);
         }
+        // 取出会话缓存（若为空则回退到查库获取）
+        Long sessionId = taskSessions.remove(taskId);
 
         // 终止真实 FurMark 进程（由工具启动并注册到 ProcessManager）
         ProcessManager.kill(taskId);
@@ -124,10 +130,13 @@ public class FurMarkTaskExecutor implements ToolTaskExecutor {
         if (task == null || !TaskStatus.RUNNING.name().equals(task.getStatus())) {
             return;
         }
+        if (sessionId == null) {
+            sessionId = task.getSessionId();
+        }
 
-        // 汇总结果(M1 模拟)
+        // 汇总结果（进度以秒为单位记录运行时长）
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("durationSec", task.getProgress() == null ? 0 : task.getProgress());
+        result.put("durationSec", 0);
         result.put("conclusion", "显卡烤机已结束。");
         task.setStatus(finalStatus.name());
         task.setResult(toJson(result));
@@ -135,7 +144,7 @@ public class FurMarkTaskExecutor implements ToolTaskExecutor {
         taskMapper.updateById(task);
 
         redisTemplate.delete(RedisKeys.taskMetric(taskId));
-        eventPublisher.publishFinished(task.getSessionId(), task);
+        eventPublisher.publishFinished(sessionId, task);
         log.info("烤机任务结束: taskId={}, status={}", taskId, finalStatus);
     }
 

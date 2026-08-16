@@ -28,6 +28,26 @@ spring:
           model: deepseek-chat
           temperature: 0.7
 
+# ==================== Agent(Hermes) 配置 ====================
+corepulse:
+  agent:
+    # Hermes 可执行文件路径（在 PATH 中可直接写 hermes）
+    hermes-path: hermes
+
+  # ==================== RAG 个人知识库配置 ====================
+  rag:
+    embedding:
+      # 阿里百炼 Embedding API Key（优先读环境变量，未设置时用默认值）
+      api-key: ${DASHSCOPE_API_KEY:sk-117936cbeb924f869c2bc08a0e6fe89f}
+      # Embedding 模型
+      model: qwen3.7-text-embedding
+    knowledge:
+      # 知识库 MD 文档路径（classpath）
+      path: classpath:knowledge/电脑维修指南_v3.md
+    vector-store:
+      # 向量数据持久化文件
+      file: ${user.home}/.corepulse/vector-store.json
+
 mybatis-plus:
   configuration:
     map-underscore-to-camel-case: true

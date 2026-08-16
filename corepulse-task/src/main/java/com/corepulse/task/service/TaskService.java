@@ -3,6 +3,7 @@ package com.corepulse.task.service;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.corepulse.common.constant.RedisKeys;
 import com.corepulse.common.exception.BizException;
+import com.corepulse.common.process.ProcessManager;
 import com.corepulse.common.result.ResultCode;
 import com.corepulse.domain.entity.ToolTask;
 import com.corepulse.domain.enums.TaskStatus;
@@ -62,11 +63,29 @@ public class TaskService {
 
     /** 创建任务并执行(立即执行 + JVM 延时自动终止) */
     public ToolTask startTask(String taskType, Map<String, Object> params, Long sessionId) {
-        Long running = taskMapper.selectCount(new LambdaQueryWrapper<ToolTask>()
+        // 检查是否存在"进行中"的任务（CREATED / RUNNING）
+        // 关键：不仅要看数据库状态，还要验证对应进程是否真的存活
+        List<ToolTask> runningTasks = taskMapper.selectList(new LambdaQueryWrapper<ToolTask>()
                 .eq(ToolTask::getTaskType, taskType)
                 .in(ToolTask::getStatus, List.of(TaskStatus.CREATED.name(), TaskStatus.RUNNING.name())));
-        if (running > 0) {
-            throw new BizException(ResultCode.TASK_STATE_ERROR, "已有进行中的 " + taskType + " 任务, 请先停止");
+
+        // 区分任务类型：仅"后台持续进程"类任务（如 furmark）做进程存活检测，
+        // agent_task 等同步执行的任务不做（其进程生命周期与后台进程不同）
+        boolean supportsProcessCheck = ProcessManager.isSupported(taskType);
+
+        for (ToolTask runningTask : runningTasks) {
+            // 支持进程检测的任务：若进程仍存活（用系统命令复核），说明任务真的在跑，拒绝
+            if (supportsProcessCheck && ProcessManager.isTaskRunning(runningTask.getId())) {
+                throw new BizException(ResultCode.TASK_STATE_ERROR,
+                        "已有进行中的 " + taskType + " 任务(任务ID=" + runningTask.getId() + "), 请先停止");
+            }
+            // 不支持进程检测，或进程已不存在(被手动关闭/崩溃)，说明是残留状态，标记为 FAILED
+            log.warn("检测到 {} 任务(taskId={}) 状态为 {}，进程检测={}，视为残留并标记为 FAILED",
+                    taskType, runningTask.getId(), runningTask.getStatus(), supportsProcessCheck);
+            runningTask.setStatus(TaskStatus.FAILED.name());
+            runningTask.setErrorMsg("任务异常中断（进程不存在或被手动关闭）");
+            runningTask.setFinishedAt(LocalDateTime.now());
+            taskMapper.updateById(runningTask);
         }
 
         // 校验执行器存在
