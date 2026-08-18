@@ -7,7 +7,8 @@ import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.SimpleVectorStore;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
@@ -18,6 +19,8 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -27,23 +30,32 @@ import java.util.stream.Collectors;
 /**
  * 个人知识库（RAG）检索服务实现
  * <p>
- * 启动时读取 resources/knowledge 下的 MD 文档，按「二级标题(### x.y)」切块并向量化入库；
+ * 启动时读取 resources/knowledge 目录下的所有 MD 文档，按标题切块并向量化入库；
  * 运行时根据用户问题做相似度检索，返回命中片段文本。
  * <p>
- * 切块策略：只有形如 {@code ### 2.1 按开机键完全没反应} 的标题才开启新块，
- * 其余（如 3.3 章节错乱用 {@code ###} 开头的列表行）并入当前块，保证语义完整。
+ * 切块策略（兼容两种文档格式）：
+ * - Markdown 格式（电脑维修指南）：{@code ### 2.1 标题} 开启新块，{@code ## 第X章} 更新当前章名
+ * - 纯文本格式（软件迁移操作手册）：{@code 第X章 标题} 开启新章，{@code 1.1 标题}（行首数字.数字）开启新块；
+ *   目录区（正文分隔符之前）的同名行不会被误认为章节标题
+ * - 块文本前缀「章名 > 节名」上下文，提升检索相关性；裸 text 代码标记行作为噪声过滤
  * <p>
- * 向量数据持久化到本地 JSON 文件：启动时先加载已有数据，为空则重新向量化并保存，
- * 避免每次启动重复调用 Embedding API。
+ * 向量数据持久化到本地 JSON 文件：启动时先加载已有数据，
+ * 任一文档变更（按全部文档内容 MD5 指纹判断）则重建向量库。
  */
 @Slf4j
 @Service
 public class KnowledgeServiceImpl implements KnowledgeService {
 
-    /** 匹配「### 数字.数字 标题」格式的真实小节标题，例如 `### 3.2 系统运行卡顿/缓慢` */
+    /** 匹配「### 数字.数字 标题」格式的 Markdown 小节标题，例如 `### 3.2 系统运行卡顿/缓慢` */
     private static final Pattern SECTION_HEADING = Pattern.compile("^###\\s+\\d+\\.\\d+\\s+.*$");
-    /** 匹配「## 第X章」章节标题，用于跳过 */
+    /** 匹配「## 第X章」Markdown 章节标题 */
     private static final Pattern CHAPTER_HEADING = Pattern.compile("^##\\s+第.*$");
+    /** 匹配纯文本章节标题（无 Markdown 符号），例如 `第四章 第三步：复制（robocopy 详解）` */
+    private static final Pattern PLAIN_CHAPTER = Pattern.compile("^第[一二三四五六七八九十百\\d]+章\\s+.*$");
+    /** 匹配纯文本小节标题（行首 数字.数字），例如 `4.2 robocopy 标准命令` */
+    private static final Pattern PLAIN_SECTION = Pattern.compile("^\\d+\\.\\d+\\s+\\S.*$");
+    /** 代码块裸语言标记行（如单独一行 text），切块时作为噪声过滤 */
+    private static final Pattern NOISE_LINE = Pattern.compile("^(text|txt)$");
     /** 默认检索条数 */
     private static final int DEFAULT_TOP_K = 3;
     /** 相似度阈值，过滤掉明显无关的片段 */
@@ -51,9 +63,9 @@ public class KnowledgeServiceImpl implements KnowledgeService {
 
     private final SimpleVectorStore vectorStore;
 
-    /** 知识库 MD 资源路径（classpath） */
-    @Value("${corepulse.rag.knowledge.path:classpath:knowledge/电脑维修指南_v3.md}")
-    private String knowledgePath;
+    /** 知识库文档位置（classpath 通配，默认 knowledge 目录下所有 MD） */
+    @Value("${corepulse.rag.knowledge.location:classpath:knowledge/*.md}")
+    private String knowledgeLocation;
 
     /** 向量数据持久化文件 */
     @Value("${corepulse.rag.vector-store.file:${user.home}/.corepulse/vector-store.json}")
@@ -93,7 +105,7 @@ public class KnowledgeServiceImpl implements KnowledgeService {
         } else {
             log.info("RAG 知识库无本地缓存，开始从 MD 文档向量化...");
         }
-        buildFromMarkdown(storeFile);
+        buildFromKnowledge(storeFile);
         writeFingerprint(versionFile, currentFingerprint);
     }
 
@@ -132,17 +144,30 @@ public class KnowledgeServiceImpl implements KnowledgeService {
             log.info("知识库已有数据，跳过加载");
             return;
         }
-        buildFromMarkdown(Paths.get(storeFilePath).toFile());
+        buildFromKnowledge(Paths.get(storeFilePath).toFile());
+    }
+
+    /** 解析知识库目录下所有 MD 资源（按文件名排序，保证指纹与切块顺序稳定） */
+    private List<Resource> resolveKnowledgeResources() throws IOException {
+        Resource[] resources = new PathMatchingResourcePatternResolver().getResources(knowledgeLocation);
+        List<Resource> list = Arrays.stream(resources)
+                .filter(Resource::isReadable)
+                .sorted(Comparator.comparing(r -> String.valueOf(r.getFilename())))
+                .collect(Collectors.toList());
+        return list;
     }
 
     /**
-     * 从 MD 文档切块、向量化并持久化
+     * 从所有知识库文档切块、向量化并持久化
      */
-    private void buildFromMarkdown(File storeFile) {
+    private void buildFromKnowledge(File storeFile) {
         try {
-            List<Document> chunks = loadChunks();
+            List<Document> chunks = new ArrayList<>();
+            for (Resource resource : resolveKnowledgeResources()) {
+                chunks.addAll(loadChunks(resource));
+            }
             if (chunks.isEmpty()) {
-                log.warn("知识库文档为空或解析失败, path={}", knowledgePath);
+                log.warn("知识库文档为空或解析失败, location={}", knowledgeLocation);
                 return;
             }
             vectorStore.add(chunks);
@@ -154,26 +179,30 @@ public class KnowledgeServiceImpl implements KnowledgeService {
             vectorStore.save(storeFile);
             log.info("知识库已加载 {} 个片段并持久化到 {}", chunks.size(), storeFile);
         } catch (Exception e) {
-            log.error("知识库初始化失败, path={}", knowledgePath, e);
+            log.error("知识库初始化失败, location={}", knowledgeLocation, e);
         }
     }
 
     /**
-     * 计算当前 MD 文档内容的指纹（MD5 前 16 位）
+     * 计算全部知识库文档的组合指纹（各文件 MD5 拼接后再取前 16 位）
+     * <p>
+     * 任一文档新增/修改/删除都会改变指纹，触发向量库重建。
      *
-     * @return 指纹字符串；文档缺失或读取失败返回 null
+     * @return 指纹字符串；无文档或读取失败返回 null
      */
     private String currentMdFingerprint() {
         try {
-            ClassPathResource resource = new ClassPathResource(knowledgePath.replace("classpath:", ""));
-            if (!resource.exists()) {
+            List<Resource> resources = resolveKnowledgeResources();
+            if (resources.isEmpty()) {
                 return null;
             }
-            byte[] bytes = resource.getInputStream().readAllBytes();
             MessageDigest md = MessageDigest.getInstance("MD5");
-            byte[] digest = md.digest(bytes);
+            for (Resource resource : resources) {
+                md.update(resource.getFilename().getBytes(StandardCharsets.UTF_8));
+                md.update(resource.getInputStream().readAllBytes());
+            }
             StringBuilder sb = new StringBuilder();
-            for (byte b : digest) {
+            for (byte b : md.digest()) {
                 sb.append(String.format("%02x", b));
             }
             return sb.length() > 16 ? sb.substring(0, 16) : sb.toString();
@@ -217,37 +246,88 @@ public class KnowledgeServiceImpl implements KnowledgeService {
     }
 
     /**
-     * 读取 MD 文件并按小节标题切块
+     * 读取单个知识库文档并按标题切块
+     * <p>
+     * 兼容两种格式：
+     * - Markdown（### X.Y 小节 / ## 第X章 章名）
+     * - 纯文本（行首 第X章 章名 / 行首 X.Y 小节，如软件迁移操作手册）
+     * 文档开头「目录」区的章节列表行会被识别并跳过，不会误切成垃圾块。
+     *
+     * @param resource 知识库文档资源
+     * @return 切块后的 Document 列表
      */
-    private List<Document> loadChunks() throws IOException {
-        ClassPathResource resource = new ClassPathResource(knowledgePath.replace("classpath:", ""));
-        if (!resource.exists()) {
-            log.error("知识库文档不存在: {}", resource);
-            return List.of();
-        }
+    private List<Document> loadChunks(Resource resource) throws IOException {
+        String sourceName = resource.getFilename() != null
+                ? resource.getFilename().replaceFirst("\\.md$", "")
+                : "知识库";
         String content = new String(resource.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
 
         // 1. 去掉 YAML front-matter（--- ... ---）
         content = stripFrontMatter(content);
 
-        // 2. 按小节标题切块
+        // 2. 按标题切块
         Map<String, StringBuilder> sections = new LinkedHashMap<>();
-        String currentKey = null;
+        String currentChapter = null;   // 当前章名，作为块的上下文前缀
+        String currentKey = null;       // 当前块标题
         StringBuilder current = new StringBuilder();
+        boolean tocMode = false;        // 处于文档开头「目录」区
+        boolean plainFormat = false;    // 纯文本格式文档（出现无 Markdown 符号的章标题后置 true）
+        java.util.Set<String> tocChapters = new java.util.HashSet<>();
 
         for (String line : content.split("\\r?\\n")) {
             String trimmed = line.trim();
-            if (CHAPTER_HEADING.matcher(trimmed).matches()) {
-                continue; // 章节标题跳过，不单独成块
+
+            // 「目录」区识别与跳过：目录行不产生块，避免切成一堆只有标题的垃圾块
+            if ("目录".equals(trimmed)) {
+                tocMode = true;
+                continue;
             }
-            if (SECTION_HEADING.matcher(trimmed).matches()) {
-                // 开启新块
+            if (tocMode) {
+                if (trimmed.isEmpty()) {
+                    continue;
+                }
+                if (PLAIN_CHAPTER.matcher(trimmed).matches()) {
+                    if (tocChapters.contains(trimmed)) {
+                        tocMode = false; // 章标题二次出现 = 正文开始，按正常章节处理
+                    } else {
+                        tocChapters.add(trimmed);
+                        continue; // 目录条目，跳过
+                    }
+                } else if (!SECTION_HEADING.matcher(trimmed).matches()) {
+                    tocMode = false; // 非章节非小节的实内容行，退出目录模式按正文处理
+                }
+            }
+
+            if (NOISE_LINE.matcher(trimmed).matches()) {
+                continue; // 裸 text 代码标记行，噪声过滤
+            }
+            if (CHAPTER_HEADING.matcher(trimmed).matches()
+                    || PLAIN_CHAPTER.matcher(trimmed).matches()) {
+                if (PLAIN_CHAPTER.matcher(trimmed).matches()) {
+                    plainFormat = true;
+                }
+                // 章节标题：冲刷当前块，开启以章名为键的新块（承接章内引言内容）
                 if (currentKey != null && current.length() > 0) {
                     sections.put(currentKey, current);
                 }
-                currentKey = trimmed;
+                currentChapter = trimmed.replaceFirst("^##\\s+", "");
+                currentKey = currentChapter;
                 current = new StringBuilder();
-                current.append(trimmed).append("\n");
+                current.append(currentChapter).append("\n");
+                continue;
+            }
+            if (SECTION_HEADING.matcher(trimmed).matches()
+                    || (plainFormat && PLAIN_SECTION.matcher(trimmed).matches())) {
+                // 小节标题：开启新块
+                if (currentKey != null && current.length() > 0) {
+                    sections.put(currentKey, current);
+                }
+                currentKey = trimmed.replaceFirst("^###\\s+", "");
+                current = new StringBuilder();
+                if (currentChapter != null) {
+                    current.append(currentChapter).append("\n");
+                }
+                current.append(currentKey).append("\n");
                 continue;
             }
             if (currentKey != null) {
@@ -269,8 +349,9 @@ public class KnowledgeServiceImpl implements KnowledgeService {
                 continue;
             }
             String text = prependRiskWarnings(raw);
-            docs.add(new Document(text, Map.of("source", "电脑维修指南_v3", "section", heading)));
+            docs.add(new Document(text, Map.of("source", sourceName, "section", heading)));
         }
+        log.info("知识库文档切块完成: {}, 共 {} 个片段", sourceName, docs.size());
         return docs;
     }
 
@@ -325,11 +406,13 @@ public class KnowledgeServiceImpl implements KnowledgeService {
     }
 
     /**
-     * 将命中的 Document 组装为可注入的文本（带来源标题）
+     * 将命中的 Document 组装为可注入的文本（带来源与标题）
      */
     private String formatResult(Document doc) {
         Object section = doc.getMetadata().get("section");
+        Object source = doc.getMetadata().get("source");
         String head = section != null ? "【" + section + "】" : "【知识库】";
-        return head + "\n" + doc.getText();
+        String from = source != null ? "（来源：" + source + "）" : "";
+        return head + from + "\n" + doc.getText();
     }
 }

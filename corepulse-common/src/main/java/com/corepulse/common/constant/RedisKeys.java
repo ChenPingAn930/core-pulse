@@ -12,4 +12,9 @@ public final class RedisKeys {
     public static String taskMetric(Long taskId) {
         return "task:metric:" + taskId;
     }
+
+    /** 会话级只读命令免确认授权: chat:readonly-auth:{sessionId} -> "1"（用户授权后只读类命令不再逐条询问） */
+    public static String readonlyAuth(Long sessionId) {
+        return "chat:readonly-auth:" + sessionId;
+    }
 }

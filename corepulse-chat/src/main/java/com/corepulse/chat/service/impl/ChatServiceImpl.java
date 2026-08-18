@@ -3,6 +3,7 @@ package com.corepulse.chat.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.corepulse.chat.Enum.PromptEnum;
 import com.corepulse.chat.Enum.ReinstallGuideEnum;
+import com.corepulse.chat.config.RecordingToolCallingManager;
 import com.corepulse.chat.mapper.ChatMessageMapper;
 import com.corepulse.chat.model.dto.ChatSendRequest;
 import com.corepulse.chat.model.vo.ChatSendVO;
@@ -38,6 +39,9 @@ import java.util.Map;
 public class ChatServiceImpl implements ChatService {
 
     private static final int MAX_HISTORY = 20;
+
+    /** 工具结果入库时的最大长度（避免大输出撑爆历史上下文，完整结果当轮已使用过） */
+    private static final int MAX_TOOL_RESULT_LENGTH = 1200;
 
     private final ChatClient chatClient;
     private final SessionService sessionService;
@@ -96,6 +100,11 @@ public class ChatServiceImpl implements ChatService {
         } catch (Exception e) {
             log.error("LLM 调用失败: sessionId={}", session.getId(), e);
             reply = "抱歉，AI 服务暂时不可用，请稍后重试。";
+        } finally {
+            // 取出本轮内部循环中执行过的工具调用结果并存入历史（role=tool），
+            // 使跨轮次时 LLM 能看到上一轮工具的真实输出（如 taskId、扫描数据）；
+            // 无论成功失败都需 drain，防止线程复用时串数据
+            saveToolRecords(session.getId());
         }
 
         // 记录最终回复这一轮是否还有工具调用
@@ -131,7 +140,8 @@ public class ChatServiceImpl implements ChatService {
      * 构建发送给 LLM 的消息列表
      * <p>
      * 组装顺序：系统提示词 + 该会话最近 N 条历史消息（按时间正序）+ 当前用户消息。
-     * 其中 system / tool 类型的消息不纳入上下文，避免干扰模型理解。
+     * 历史中的 tool 消息（工具执行结果）会以"工具执行记录"形式还原进上下文，
+     * 保证跨轮次时 LLM 能看到上一轮工具的真实输出；system 消息不纳入上下文。
      * <p>
      * 若用户消息命中「重装系统」意图，则额外注入重装系统图文引导（ReinstallGuideEnum），
      * 让 LLM 按标准流程引导用户，同时不影响日常对话。
@@ -148,9 +158,12 @@ public class ChatServiceImpl implements ChatService {
 
         // RAG：检索个人知识库，命中则注入相关知识片段，辅助诊断
         // topK=5 提高硬件操作细节(如 4.1 内存拔插)被命中的概率，避免只命中概览块而丢失安全细节
-        List<String> knowledge = knowledgeService.search(userContent, 5);
-        if (!knowledge.isEmpty()) {
-            messages.add(new SystemMessage(buildKnowledgePrompt(knowledge)));
+        // 短确认消息（可以/好的/继续等）跳过检索，避免无关片段注入上下文干扰模型
+        if (!isShortConfirmation(userContent)) {
+            List<String> knowledge = knowledgeService.search(userContent, 5);
+            if (!knowledge.isEmpty()) {
+                messages.add(new SystemMessage(buildKnowledgePrompt(knowledge)));
+            }
         }
 
         // 重装系统意图检测：命中则注入图文引导
@@ -172,11 +185,34 @@ public class ChatServiceImpl implements ChatService {
                 messages.add(new UserMessage(m.getContent()));
             } else if (MessageRole.ASSISTANT.getValue().equals(role)) {
                 messages.add(new AssistantMessage(m.getContent()));
+            } else if (MessageRole.TOOL.getValue().equals(role)) {
+                // 工具结果还原为上下文：因未保存原始 toolCallId，无法还原为 API 层 tool 消息，
+                // 以带前缀的普通消息形式注入，既避免消息配对校验报错，又能让 LLM 看到工具事实
+                messages.add(new UserMessage("[工具执行记录] 工具 " + m.getToolName()
+                        + " 的执行结果：" + m.getContent()));
             }
-            // system / tool 消息不纳入上下文
+            // system 消息不纳入上下文
         }
 
         return messages;
+    }
+
+    /**
+     * 保存本轮对话中执行过的工具调用结果（role=tool）
+     * <p>
+     * 工具结果由 RecordingToolCallingManager 在 ChatClient 内部工具循环中记录，
+     * 这里取出后截断入库，保证历史上下文不被大输出撑爆。
+     *
+     * @param sessionId 所属会话 ID
+     */
+    private void saveToolRecords(Long sessionId) {
+        for (RecordingToolCallingManager.ToolCallRecord record : RecordingToolCallingManager.drainRecords()) {
+            String result = record.result() == null ? "" : record.result();
+            if (result.length() > MAX_TOOL_RESULT_LENGTH) {
+                result = result.substring(0, MAX_TOOL_RESULT_LENGTH) + "...(已截断)";
+            }
+            saveMessage(sessionId, MessageRole.TOOL.getValue(), result, record.toolName(), null);
+        }
     }
 
     /**
@@ -196,6 +232,29 @@ public class ChatServiceImpl implements ChatService {
         msg.setToolName(toolName);
         msg.setTaskId(taskId);
         messageMapper.insert(msg);
+    }
+
+    /** 短确认/闲聊消息特征词（命中且消息很短时跳过 RAG 检索） */
+    private static final List<String> SHORT_CONFIRM_WORDS = List.of(
+            "可以", "好的", "确认", "同意", "继续", "嗯", "行", "ok", "是的", "对",
+            "不用问我", "直接执行", "好", "开始"
+    );
+
+    /**
+     * 判断用户消息是否为短确认/闲聊消息
+     * <p>
+     * 此类消息（如"可以""好的"）语义信息极少，RAG 检索往往命中无关片段（如"笔记本进水"），
+     * 注入后反而干扰模型对上下文的理解，直接跳过检索。
+     *
+     * @param content 用户消息内容
+     * @return 是否为短确认消息
+     */
+    private boolean isShortConfirmation(String content) {
+        if (content == null || content.trim().length() > 8) {
+            return false;
+        }
+        String lower = content.trim().toLowerCase();
+        return SHORT_CONFIRM_WORDS.stream().anyMatch(lower::contains);
     }
 
     /**
