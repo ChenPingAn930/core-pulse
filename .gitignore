@@ -41,3 +41,6 @@ Thumbs.db
 # 第三方工具的运行时索引/数据库（自动生成，不应纳入版本库）
 Everything.db
 Everything.ini
+
+# 大型运行时/安装包（超过 Gitee 100MB 单文件限制，应自行下载或存云盘）
+tool/运行库/*.exe
