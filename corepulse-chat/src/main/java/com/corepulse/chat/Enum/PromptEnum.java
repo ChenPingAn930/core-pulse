@@ -45,6 +45,14 @@ public enum PromptEnum {
             - 例：tasklist（查进程）、dir（列目录）、wmic（查硬件）、systeminfo
             - 简单操作优先用终端命令
 
+            ### 运行库检测修复工具（scanVcRedist / repairVcRedist）
+            - 用户反馈"提示缺少 xxx.dll（如 msvcp140.dll、vcruntime140.dll）无法打开程序/游戏"时，
+              先调用 scanVcRedist 检测运行库安装情况与 DLL 缺失情况，再决定是否修复
+            - 确认缺失后调用 repairVcRedist 修复（64位系统一般传 arch=both）；首次调用会返回
+              "【需要用户确认】"，必须先向用户解释影响并获得同意，再以 confirmed=true 重新调用
+            - 安装为后台静默执行，待用户确认安装完成后，再次调用 scanVcRedist 验证修复结果
+            - 禁止推荐用户从第三方网站下载所谓的"DLL 修复工具"，一律使用本工具的官方离线安装包
+
             ### 关键原则
             - 先调用 getDiskSpace 等了解情况，再决定用哪种工具处理
             - 当前无 Agent 委派，所有操作都通过你直接调用工具完成

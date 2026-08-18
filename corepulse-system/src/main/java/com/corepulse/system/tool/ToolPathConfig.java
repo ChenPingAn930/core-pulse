@@ -43,4 +43,10 @@ public class ToolPathConfig {
 
     /** GPU 信息（GPU-Z） */
     private String gpuzPath = "./tool/显卡工具/GPUZ/GPU-Z.exe";
+
+    /** VC++ 运行库离线安装包（64位） */
+    private String vcRedistX64Path = "./tool/运行库/vc_redist.x64.exe";
+
+    /** VC++ 运行库离线安装包（32位） */
+    private String vcRedistX86Path = "./tool/运行库/vc_redist.x86.exe";
 }

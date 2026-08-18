@@ -79,10 +79,17 @@ public final class ToolProcessRunner {
             return "工具启动失败：未找到 " + exe.getName() + "，路径=" + exePath;
         }
         try {
-            // 拼装参数（含引号处理）
+            // 拼装参数：通过 -ArgumentList 透传给目标程序（单引号包裹并转义）
             String argStr = "";
             if (args != null && args.length > 0) {
-                argStr = " " + String.join(" ", args);
+                StringBuilder sb = new StringBuilder(" -ArgumentList ");
+                for (int i = 0; i < args.length; i++) {
+                    if (i > 0) {
+                        sb.append(",");
+                    }
+                    sb.append("'").append(args[i].replace("'", "''")).append("'");
+                }
+                argStr = sb.toString();
             }
             // 用 PowerShell Start-Process -Verb RunAs 提权启动，目录切换到 exe 所在目录
             String psCommand = String.format(
