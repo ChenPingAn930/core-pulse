@@ -29,13 +29,8 @@ spring:
           model: deepseek-chat
           temperature: 0.7
 
-# ==================== Agent(Hermes) 配置 ====================
+# ==================== RAG 个人知识库配置 ====================
 corepulse:
-  agent:
-    # Hermes 可执行文件路径（在 PATH 中可直接写 hermes）
-    hermes-path: hermes
-
-  # ==================== RAG 个人知识库配置 ====================
   rag:
     embedding:
       # 阿里百炼 Embedding API Key 从环境变量读取（IDEA 中配置 DASHSCOPE_API_KEY）

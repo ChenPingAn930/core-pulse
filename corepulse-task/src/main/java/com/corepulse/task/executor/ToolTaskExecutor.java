@@ -4,7 +4,6 @@ import com.corepulse.domain.enums.TaskStatus;
 
 /**
  * 工具任务执行器: 一个任务类型一个实现(烤机/内存/清理...)
- * M1 为模拟执行器, M2 接入真实 FurMark/Hermes。
  * 命名 ToolTaskExecutor 避免与 Spring 的 TaskExecutor 冲突。
  */
 public interface ToolTaskExecutor {
