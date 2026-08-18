@@ -37,3 +37,7 @@ target/
 # OS
 .DS_Store
 Thumbs.db
+
+# 第三方工具的运行时索引/数据库（自动生成，不应纳入版本库）
+Everything.db
+Everything.ini
