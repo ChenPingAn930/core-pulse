@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.corepulse.chat.Enum.PromptEnum;
 import com.corepulse.chat.Enum.ReinstallGuideEnum;
 import com.corepulse.chat.config.RecordingToolCallingManager;
+import com.corepulse.chat.event.ChatEventPublisher;
 import com.corepulse.chat.mapper.ChatMessageMapper;
 import com.corepulse.chat.model.dto.ChatSendRequest;
 import com.corepulse.chat.model.vo.ChatSendVO;
@@ -47,6 +48,7 @@ public class ChatServiceImpl implements ChatService {
     private final SessionService sessionService;
     private final ChatMessageMapper messageMapper;
     private final KnowledgeService knowledgeService;
+    private final ChatEventPublisher chatEventPublisher;
 
     /**
      * 发送消息 - AI 对话核心流程
@@ -75,12 +77,17 @@ public class ChatServiceImpl implements ChatService {
         // 3. 保存用户消息
         saveMessage(session.getId(), MessageRole.USER.getValue(), content, null, null);
 
-        // 4. 构建上下文消息（传入用户消息用于重装意图检测）
+        // 4. 推送"思考中"事件：让前端在 LLM 处理期间实时看到当前阶段，而不是干等 HTTP 响应
+        chatEventPublisher.publishThinking(session.getId(), "思考中");
+
+        // 5. 构建上下文消息（传入用户消息用于重装意图检测）
         List<Message> messages = buildMessages(session.getId(), content);
 
-        // 5. 调用 LLM（注入工具上下文：sessionId 供工具方法使用，不暴露给 LLM 参数）
+        // 6. 调用 LLM（注入工具上下文：sessionId 供工具方法使用，不暴露给 LLM 参数）
+        // 同时把会话 ID 写入 RecordingToolCallingManager 的 ThreadLocal，供工具执行期间推送过程事件
         String reply;
         java.util.List<String> invokedTools = new java.util.ArrayList<>();
+        RecordingToolCallingManager.setCurrentSession(session.getId());
         try {
             org.springframework.ai.chat.model.ChatResponse chatResponse = chatClient.prompt()
                     .messages(messages)
@@ -105,6 +112,7 @@ public class ChatServiceImpl implements ChatService {
             // 使跨轮次时 LLM 能看到上一轮工具的真实输出（如 taskId、扫描数据）；
             // 无论成功失败都需 drain，防止线程复用时串数据
             saveToolRecords(session.getId());
+            RecordingToolCallingManager.clearCurrentSession();
         }
 
         // 记录最终回复这一轮是否还有工具调用
@@ -119,7 +127,7 @@ public class ChatServiceImpl implements ChatService {
             reply = "我已经处理了你的请求，但没能生成合适的回复，请再试一次。";
         }
 
-        // 6. 保存 AI 回复
+        // 7. 保存 AI 回复
         saveMessage(session.getId(), MessageRole.ASSISTANT.getValue(), reply, null, null);
 
         log.info("会话 {} 回复完成, replyLen={}", session.getId(), reply.length());

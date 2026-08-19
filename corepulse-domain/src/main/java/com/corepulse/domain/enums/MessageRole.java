@@ -8,7 +8,7 @@ public enum MessageRole {
     ASSISTANT("assistant"),
     SYSTEM("system"),
     TOOL("tool");
-
+    // value是角色的标识
     private final String value;
 
     MessageRole(String value) {

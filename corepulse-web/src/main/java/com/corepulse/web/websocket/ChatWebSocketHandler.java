@@ -12,7 +12,9 @@ import java.net.URI;
 
 /**
  * 聊天 WebSocket: ws://localhost:8080/ws/chat?sessionId={chatSessionId}
- * 服务端推送: tool_progress / tool_finished / confirm_request
+ * 服务端推送:
+ * - 对话过程事件: chat_thinking / tool_started / tool_result
+ * - 异步任务事件: tool_progress / tool_finished / confirm_request
  */
 @Slf4j
 @Component
