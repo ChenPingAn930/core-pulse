@@ -18,6 +18,8 @@ public class ChatSession {
     private Long userId;
     // 会话标题
     private String title;
+    // 会话摘要
+    private String summary;
     // 会话状态
     private Integer status;
     // 创建时间

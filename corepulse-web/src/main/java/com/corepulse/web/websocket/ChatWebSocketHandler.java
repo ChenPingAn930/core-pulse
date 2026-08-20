@@ -22,9 +22,10 @@ import java.net.URI;
 public class ChatWebSocketHandler extends TextWebSocketHandler {
 
     private final WebSocketSessionManager sessionManager;
-
+    // 连接成功时注册 WebSocket 会话
     @Override
     public void afterConnectionEstablished(WebSocketSession session) throws Exception {
+        // 从 URI 中解析 sessionId
         Long chatSessionId = parseSessionId(session.getUri());
         if (chatSessionId != null) {
             sessionManager.register(chatSessionId, session);
@@ -33,7 +34,7 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
             session.close(CloseStatus.BAD_DATA);
         }
     }
-
+    // 收到消息时预留: 心跳。客户端发 {"type":"ping"} -> pong
     @Override
     protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
         // M1 预留: 心跳。客户端发 {"type":"ping"} -> pong
@@ -41,7 +42,7 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
             session.sendMessage(new TextMessage("{\"type\":\"pong\"}"));
         }
     }
-
+    // 连接关闭时注销 WebSocket 会话
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
         Long chatSessionId = parseSessionId(session.getUri());
@@ -49,9 +50,11 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
             sessionManager.remove(chatSessionId);
         }
     }
-
+    // 从 URI 中解析 sessionId
+    // 请求格式: ws://localhost:8080/ws/chat?sessionId={chatSessionId}
     private Long parseSessionId(URI uri) {
         try {
+            // 解析 query 参数 sessionId={chatSessionId}部分
             String query = uri.getQuery();
             if (query == null) {
                 return null;

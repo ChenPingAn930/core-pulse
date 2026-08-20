@@ -6,6 +6,7 @@ import com.corepulse.chat.Enum.ReinstallGuideEnum;
 import com.corepulse.chat.config.RecordingToolCallingManager;
 import com.corepulse.chat.event.ChatEventPublisher;
 import com.corepulse.chat.mapper.ChatMessageMapper;
+import com.corepulse.chat.mapper.ChatSessionMapper;
 import com.corepulse.chat.model.dto.ChatSendRequest;
 import com.corepulse.chat.model.vo.ChatSendVO;
 import com.corepulse.chat.rag.KnowledgeService;
@@ -21,6 +22,7 @@ import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -47,6 +49,7 @@ public class ChatServiceImpl implements ChatService {
     private final ChatClient chatClient;
     private final SessionService sessionService;
     private final ChatMessageMapper messageMapper;
+    private final ChatSessionMapper sessionMapper;
     private final KnowledgeService knowledgeService;
     private final ChatEventPublisher chatEventPublisher;
 
@@ -85,24 +88,30 @@ public class ChatServiceImpl implements ChatService {
 
         // 6. 调用 LLM（注入工具上下文：sessionId 供工具方法使用，不暴露给 LLM 参数）
         // 同时把会话 ID 写入 RecordingToolCallingManager 的 ThreadLocal，供工具执行期间推送过程事件
+        // 注意：这里的 reply 是最终回复，而不是 LLM 的输出，
         String reply;
         java.util.List<String> invokedTools = new java.util.ArrayList<>();
         RecordingToolCallingManager.setCurrentSession(session.getId());
         try {
-            org.springframework.ai.chat.model.ChatResponse chatResponse = chatClient.prompt()
+            // 调用 LLM
+            ChatResponse chatResponse = chatClient.prompt()
                     .messages(messages)
                     .toolContext(Map.of("sessionId", session.getId()))
+                    // 同步调用
                     .call()
                     .chatResponse();
 
             // 记录本次回复所基于的工具调用（工具调用信息在 AssistantMessage 的 toolCalls 中）
             chatResponse.getResults().forEach(result -> {
                 org.springframework.ai.chat.messages.AssistantMessage output = result.getOutput();
+                // 判断输出是否为空，避免空指针异常 以及 判断 toolCalls 是否为空，避免空指针异常
+                // 注意output.getToolCalls()不是指代的工具调用，而是指代的这里的对象是否被创建
                 if (output != null && output.getToolCalls() != null) {
+                    // 获取工具调用名称
                     output.getToolCalls().forEach(tc -> invokedTools.add(tc.name()));
                 }
             });
-
+            // 获取最终回复
             reply = chatResponse.getResult() != null ? chatResponse.getResult().getOutput().getText() : null;
         } catch (Exception e) {
             log.error("LLM 调用失败: sessionId={}", session.getId(), e);
@@ -131,6 +140,60 @@ public class ChatServiceImpl implements ChatService {
         saveMessage(session.getId(), MessageRole.ASSISTANT.getValue(), reply, null, null);
 
         log.info("会话 {} 回复完成, replyLen={}", session.getId(), reply.length());
+
+        //1.拿到摘要
+        String summary = sessionMapper.selectOne(new LambdaQueryWrapper<ChatSession>()
+                        .eq(ChatSession::getId, sessionId))
+                .getSummary();
+        if (summary == null || summary.isBlank()) {
+            summary = "无";
+        }
+        //2.拼接摘要和用户消息
+        List<Message> summaryMessages = new ArrayList<>();
+
+        summaryMessages.add(new UserMessage(
+                "旧摘要：\n" + (summary == null ? "无" : summary)
+                        + "\n\n本轮用户消息：\n" + content
+        ));
+
+        summaryMessages.add(new AssistantMessage(reply));
+        //3.调用LLM生成摘要；摘要失败不能影响本轮正式回复
+        try {
+            ChatResponse summaryResponse = chatClient.prompt()
+                    .messages(summaryMessages)
+                    .system(PromptEnum.SUMMARY_GENERATION.getContent())
+                    .call()
+                    .chatResponse();
+            log.info("会话 {} 摘要生成完成, summaryResponse={}", session.getId(), summaryResponse);
+
+            String newSummary = summaryResponse.getResult()
+                    .getOutput()
+                    .getText();
+            if (newSummary == null || newSummary.isBlank()) {
+                log.warn("会话 {} 摘要内容为空，跳过更新", session.getId());
+            } else {
+                //4.更新摘要
+                ChatSession sessionForUpdate = sessionMapper.selectOne(
+                        new LambdaQueryWrapper<ChatSession>()
+                                .eq(ChatSession::getId, sessionId));
+                if (sessionForUpdate == null) {
+                    log.warn("会话 {} 不存在，跳过摘要更新", session.getId());
+                } else {
+                    sessionForUpdate.setSummary(newSummary.trim());
+                    int updated = sessionMapper.updateById(sessionForUpdate);
+                    if (updated > 0) {
+                        log.info("会话 {} 更新摘要成功, newSummary={}",
+                                session.getId(), newSummary);
+                    } else {
+                        log.warn("会话 {} 更新摘要失败，未更新任何记录", session.getId());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("会话 {} 摘要生成或更新失败，跳过本次摘要更新",
+                    session.getId(), e);
+        }
+
         return ChatSendVO.builder()
                 .sessionId(session.getId())
                 .reply(reply)
@@ -159,6 +222,7 @@ public class ChatServiceImpl implements ChatService {
      * @return 组装好的 Spring AI Message 列表
      */
     private List<Message> buildMessages(Long sessionId, String userContent) {
+        // 构建消息列表
         List<Message> messages = new ArrayList<>();
 
         // 系统提示
@@ -170,6 +234,7 @@ public class ChatServiceImpl implements ChatService {
         if (!isShortConfirmation(userContent)) {
             List<String> knowledge = knowledgeService.search(userContent, 5);
             if (!knowledge.isEmpty()) {
+                // 组装知识片段为系统提示
                 messages.add(new SystemMessage(buildKnowledgePrompt(knowledge)));
             }
         }
@@ -179,15 +244,17 @@ public class ChatServiceImpl implements ChatService {
             messages.add(new SystemMessage(buildReinstallGuide()));
         }
 
-        // 历史消息（最近 MAX_HISTORY 条，按 ID 正序）
+        /* 历史消息（最近 MAX_HISTORY 条，按 ID 正序）*/
         List<ChatMessage> history = messageMapper.selectList(
                 new LambdaQueryWrapper<ChatMessage>()
                         .eq(ChatMessage::getSessionId, sessionId)
                         .orderByDesc(ChatMessage::getId)
                         .last("LIMIT " + MAX_HISTORY));
+        // 倒序，保证按时间正序
         Collections.reverse(history);
-
+        // 组装历史消息
         for (ChatMessage m : history) {
+            // 拿到消息角色 user / assistant / system / tool */
             String role = m.getRole();
             if (MessageRole.USER.getValue().equals(role)) {
                 messages.add(new UserMessage(m.getContent()));
@@ -202,6 +269,15 @@ public class ChatServiceImpl implements ChatService {
             // system 消息不纳入上下文
         }
 
+        //添加摘要进消息列表
+        //1.拿到摘要
+        String summary = sessionMapper.selectOne(new LambdaQueryWrapper<ChatSession>()
+                .eq(ChatSession::getId, sessionId))
+                .getSummary();
+        if (summary == null || summary.isBlank()) {
+            summary = "无";
+        }
+        messages.add(new SystemMessage(summary));
         return messages;
     }
 

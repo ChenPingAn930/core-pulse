@@ -69,6 +69,7 @@ public class SessionServiceImpl implements SessionService {
                 SessionVO.builder()
                         .id(s.getId())
                         .title(s.getTitle())
+                        .summary(s.getSummary())
                         .updatedAt(s.getUpdatedAt())
                         .build()
         ).toList();

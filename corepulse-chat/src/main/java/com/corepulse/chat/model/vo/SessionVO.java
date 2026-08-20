@@ -23,6 +23,9 @@ public class SessionVO {
     /** 会话标题 */
     private String title;
 
+    /** 会话摘要 */
+    private String summary;
+
     /** 最后更新时间 */
     @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
     private LocalDateTime updatedAt;

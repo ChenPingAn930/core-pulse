@@ -108,12 +108,14 @@ public class KnowledgeServiceImpl implements KnowledgeService {
         buildFromKnowledge(storeFile);
         writeFingerprint(versionFile, currentFingerprint);
     }
-
+    // 检索
     @Override
     public List<String> search(String query, int topK) {
+        // 空查询直接返回空列表
         if (!StringUtils.hasText(query)) {
             return List.of();
         }
+        // topk大于0则使用topk，否则使用默认值
         int k = topK > 0 ? topK : DEFAULT_TOP_K;
         List<Document> docs = vectorStore.similaritySearch(
                 SearchRequest.builder()

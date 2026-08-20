@@ -18,7 +18,7 @@ public class WebSocketSessionManager {
 
     private final Map<Long, WebSocketSession> sessions = new ConcurrentHashMap<>();
     private final ObjectMapper objectMapper = new ObjectMapper();
-
+    // 注册 WebSocket 会话
     public void register(Long chatSessionId, WebSocketSession session) {
         sessions.put(chatSessionId, session);
         log.info("WebSocket 连接注册: chatSessionId={}", chatSessionId);
@@ -27,7 +27,7 @@ public class WebSocketSessionManager {
     public void remove(Long chatSessionId) {
         sessions.remove(chatSessionId);
     }
-
+    // 推送消息
     public void send(Long chatSessionId, Object payload) {
         WebSocketSession session = sessions.get(chatSessionId);
         if (session == null || !session.isOpen()) {
