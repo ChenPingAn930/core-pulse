@@ -6,7 +6,7 @@ import com.baomidou.mybatisplus.annotation.TableName;
 import lombok.Data;
 
 import java.time.LocalDateTime;
-
+// 会话实体
 @Data
 @TableName("t_chat_session")
 public class ChatSession {
@@ -20,6 +20,8 @@ public class ChatSession {
     private String title;
     // 会话摘要
     private String summary;
+    // 最新摘要消息ID
+    private Long lastSummarizedMessageId;
     // 会话状态
     private Integer status;
     // 创建时间

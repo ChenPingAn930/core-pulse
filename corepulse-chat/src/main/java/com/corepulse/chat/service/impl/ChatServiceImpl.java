@@ -1,6 +1,8 @@
 package com.corepulse.chat.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.corepulse.chat.Enum.PromptEnum;
 import com.corepulse.chat.Enum.ReinstallGuideEnum;
 import com.corepulse.chat.config.RecordingToolCallingManager;
@@ -138,60 +140,82 @@ public class ChatServiceImpl implements ChatService {
 
         // 7. 保存 AI 回复
         saveMessage(session.getId(), MessageRole.ASSISTANT.getValue(), reply, null, null);
-
         log.info("会话 {} 回复完成, replyLen={}", session.getId(), reply.length());
 
-        //1.拿到摘要
-        String summary = sessionMapper.selectOne(new LambdaQueryWrapper<ChatSession>()
-                        .eq(ChatSession::getId, sessionId))
-                .getSummary();
+        // 8. 摘要只处理上次游标之后的消息；摘要失败时不推进游标
+        ChatSession currentSession = sessionMapper.selectById(sessionId);
+        Long lastSummarizedMessageId = currentSession.getLastSummarizedMessageId() == null
+                ? 0L : currentSession.getLastSummarizedMessageId();
+        // 获取未摘要的消息
+        List<ChatMessage> unsummarizedMessages = messageMapper.selectList(
+                new LambdaQueryWrapper<ChatMessage>()
+                        .eq(ChatMessage::getSessionId, sessionId)
+                        .gt(ChatMessage::getId, lastSummarizedMessageId)
+                        .orderByAsc(ChatMessage::getId)
+        );
+
+        log.info("会话 {} 摘要游标={}, 未摘要消息数={}",
+                session.getId(), lastSummarizedMessageId, unsummarizedMessages.size());
+        if (unsummarizedMessages.size() < 20) {
+            log.info("会话 {} 未摘要消息不足20条，不生成摘要", session.getId());
+            return ChatSendVO.builder()
+                    .sessionId(session.getId())
+                    .reply(reply)
+                    .taskId(null)
+                    .build();
+        }
+        // 获取旧摘要
+        String summary = currentSession.getSummary();
         if (summary == null || summary.isBlank()) {
             summary = "无";
         }
-        //2.拼接摘要和用户消息
+        // 构建摘要消息
         List<Message> summaryMessages = new ArrayList<>();
+        summaryMessages.add(new UserMessage("旧摘要：\n" + summary + "\n\n新增对话："));
+        for (ChatMessage message : unsummarizedMessages) {
+            if (MessageRole.USER.getValue().equals(message.getRole())) {
+                summaryMessages.add(new UserMessage(message.getContent()));
+            } else if (MessageRole.ASSISTANT.getValue().equals(message.getRole())) {
+                summaryMessages.add(new AssistantMessage(message.getContent()));
+            } else if (MessageRole.TOOL.getValue().equals(message.getRole())) {
+                summaryMessages.add(new UserMessage("[工具执行记录] 工具 " + message.getToolName()
+                        + " 的执行结果：" + message.getContent()));
+            }
+        }
 
-        summaryMessages.add(new UserMessage(
-                "旧摘要：\n" + (summary == null ? "无" : summary)
-                        + "\n\n本轮用户消息：\n" + content
-        ));
-
-        summaryMessages.add(new AssistantMessage(reply));
-        //3.调用LLM生成摘要；摘要失败不能影响本轮正式回复
         try {
             ChatResponse summaryResponse = chatClient.prompt()
                     .messages(summaryMessages)
                     .system(PromptEnum.SUMMARY_GENERATION.getContent())
                     .call()
                     .chatResponse();
-            log.info("会话 {} 摘要生成完成, summaryResponse={}", session.getId(), summaryResponse);
-
-            String newSummary = summaryResponse.getResult()
-                    .getOutput()
-                    .getText();
+            String newSummary = summaryResponse.getResult() == null
+                    || summaryResponse.getResult().getOutput() == null
+                    ? null : summaryResponse.getResult().getOutput().getText();
             if (newSummary == null || newSummary.isBlank()) {
-                log.warn("会话 {} 摘要内容为空，跳过更新", session.getId());
+                log.warn("会话 {} 摘要内容为空，保留原摘要和游标", session.getId());
             } else {
-                //4.更新摘要
-                ChatSession sessionForUpdate = sessionMapper.selectOne(
-                        new LambdaQueryWrapper<ChatSession>()
-                                .eq(ChatSession::getId, sessionId));
-                if (sessionForUpdate == null) {
-                    log.warn("会话 {} 不存在，跳过摘要更新", session.getId());
+                Long summaryToMessageId = unsummarizedMessages.get(unsummarizedMessages.size() - 1).getId();
+                LambdaUpdateWrapper<ChatSession> summaryUpdate = new LambdaUpdateWrapper<ChatSession>()
+                        .set(ChatSession::getSummary, newSummary.trim())
+                        .set(ChatSession::getLastSummarizedMessageId, summaryToMessageId)
+                        .eq(ChatSession::getId, sessionId);
+                if (currentSession.getLastSummarizedMessageId() == null) {
+                    summaryUpdate.isNull(ChatSession::getLastSummarizedMessageId);
                 } else {
-                    sessionForUpdate.setSummary(newSummary.trim());
-                    int updated = sessionMapper.updateById(sessionForUpdate);
-                    if (updated > 0) {
-                        log.info("会话 {} 更新摘要成功, newSummary={}",
-                                session.getId(), newSummary);
-                    } else {
-                        log.warn("会话 {} 更新摘要失败，未更新任何记录", session.getId());
-                    }
+                    summaryUpdate.eq(ChatSession::getLastSummarizedMessageId,
+                            currentSession.getLastSummarizedMessageId());
+                }
+                int updated = sessionMapper.update(summaryUpdate);
+                if (updated > 0) {
+                    log.info("会话 {} 更新摘要和游标成功, toMessageId={}",
+                            session.getId(), summaryToMessageId);
+                } else {
+                    log.warn("会话 {} 摘要状态未更新，可能存在并发更新", session.getId());
                 }
             }
         } catch (Exception e) {
-            log.warn("会话 {} 摘要生成或更新失败，跳过本次摘要更新",
-                    session.getId(), e);
+            log.warn("会话 {} 摘要生成或更新失败，保留原摘要和游标", session.getId(), e);
         }
 
         return ChatSendVO.builder()
@@ -307,15 +331,22 @@ public class ChatServiceImpl implements ChatService {
      * @param content   消息内容
      * @param toolName  触发的工具名称（非工具消息传 null）
      * @param taskId    关联的异步任务 ID（无则传 null）
+     * @return 消息 ID
      */
-    private void saveMessage(Long sessionId, String role, String content, String toolName, Long taskId) {
+    private Long saveMessage(Long sessionId, String role, String content, String toolName, Long taskId) {
         ChatMessage msg = new ChatMessage();
         msg.setSessionId(sessionId);
         msg.setRole(role);
         msg.setContent(content);
         msg.setToolName(toolName);
         msg.setTaskId(taskId);
-        messageMapper.insert(msg);
+        int insert = messageMapper.insert(msg);
+        if (insert > 0)
+            log.info("会话 {} 保存消息成功, role={}, content={}, toolName={}, taskId={}",
+                    sessionId, role, content, toolName, taskId);
+        else
+            log.warn("会话 {} 保存消息失败，未插入任何记录", sessionId);
+        return msg.getId();
     }
 
     /** 短确认/闲聊消息特征词（命中且消息很短时跳过 RAG 检索） */
