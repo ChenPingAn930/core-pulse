@@ -125,7 +125,6 @@ public class ChatServiceImpl implements ChatService {
             saveToolRecords(session.getId());
             RecordingToolCallingManager.clearCurrentSession();
         }
-
         // 记录最终回复这一轮是否还有工具调用
         // 说明：多轮工具调用发生在 chatClient 内部循环中，最终 chatResponse 通常是 LLM 直接输出文字的那一轮
         if (!invokedTools.isEmpty()) {
@@ -416,18 +415,7 @@ public class ChatServiceImpl implements ChatService {
      * @return 可注入的系统提示文本
      */
     private String buildKnowledgePrompt(List<String> knowledge) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("【维修知识库参考】以下是从本地维修知识库检索到的相关资料。你必须严格遵守以下规则：\n")
-                .append("1. 优先依据这些资料回答，回答要专业、准确、通俗易懂。\n")
-                .append("2. 凡涉及硬件插拔、拆机、断电、短路等操作，必须【完整、逐字】保留知识库中给出的安全操作细节，")
-                .append("例如「按下内存插槽两端的卡扣拔出内存」「断电后打开机箱」「释放残余电量」「橡皮擦擦拭金手指」「听到卡哒声即安装到位」「佩戴防静电手环」等，")
-                .append("严禁省略、简化或自己概括这些关键动作。\n")
-                .append("3. 【风险警告必须转述，这是最高优先级】：知识库中出现的任何以「⚠️ 风险警告」「风险警告」开头的段落，")
-                .append("你必须【在向用户给出任何对应操作步骤的同时，把该风险警告的内容完整、逐字转述给用户】，")
-                .append("例如「必须先拔掉电源线并长按开机键10秒释放残余电量」「建议佩戴防静电手环或先触摸金属物体释放静电」「切勿带电操作」「开箱可能使保修失效」等。")
-                .append("不得省略、不得只在末尾一笔带过、不得只提示而不给具体内容。\n")
-                .append("4. 知识库明确标注为「进阶操作」或「高风险」的步骤，必须在回答中同步提示风险，并提醒用户量力而行、必要时送修。\n")
-                .append("5. 不要臆造知识库中不存在的操作步骤；若知识库未覆盖用户问题，则用通用知识谨慎回答并说明这是通用建议。\n\n");
+        StringBuilder sb = new StringBuilder(PromptEnum.KNOWLEDGE_BASE_REFERENCE.getContent());
         for (String k : knowledge) {
             sb.append("------\n").append(k).append("\n");
         }
