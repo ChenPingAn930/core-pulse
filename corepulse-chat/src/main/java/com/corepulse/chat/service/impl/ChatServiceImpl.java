@@ -2,7 +2,6 @@ package com.corepulse.chat.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
-import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.corepulse.chat.Enum.PromptEnum;
 import com.corepulse.chat.Enum.ReinstallGuideEnum;
 import com.corepulse.chat.config.RecordingToolCallingManager;
@@ -25,6 +24,7 @@ import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -48,7 +48,12 @@ public class ChatServiceImpl implements ChatService {
     /** 工具结果入库时的最大长度（避免大输出撑爆历史上下文，完整结果当轮已使用过） */
     private static final int MAX_TOOL_RESULT_LENGTH = 1200;
 
-    private final ChatClient chatClient;
+    @Qualifier("primaryChatClient")
+    private final ChatClient primaryChatClient;
+
+    @Qualifier("backupChatClient")
+    private final ChatClient backupChatClient;
+
     private final SessionService sessionService;
     private final ChatMessageMapper messageMapper;
     private final ChatSessionMapper sessionMapper;
@@ -58,7 +63,7 @@ public class ChatServiceImpl implements ChatService {
     /**
      * 发送消息 - AI 对话核心流程
      * <p>
-     * 步骤：获取/创建会话 -> 自动生成标题 -> 保存用户消息 -> 构建上下文 -> 调用 LLM -> 保存回复
+     * 步骤：获取/创建会话 -> 自动生成标题 -> 保存用户消息 -> 构建上下文buildMessages() -> 调用 LLM -> 保存回复
      *
      * @param request 发送消息请求（包含会话ID和用户消息内容）
      * @return AI 回复结果（会话ID + 回复内容 + 异步任务ID）
@@ -91,31 +96,56 @@ public class ChatServiceImpl implements ChatService {
         // 6. 调用 LLM（注入工具上下文：sessionId 供工具方法使用，不暴露给 LLM 参数）
         // 同时把会话 ID 写入 RecordingToolCallingManager 的 ThreadLocal，供工具执行期间推送过程事件
         // 注意：这里的 reply 是最终回复，而不是 LLM 的输出，
-        String reply;
-        java.util.List<String> invokedTools = new java.util.ArrayList<>();
+        String reply = null;
+        List<String> invokedTools = new ArrayList<>();
         RecordingToolCallingManager.setCurrentSession(session.getId());
+        boolean success = false;
         try {
-            // 调用 LLM
-            ChatResponse chatResponse = chatClient.prompt()
-                    .messages(messages)
-                    .toolContext(Map.of("sessionId", session.getId()))
-                    // 同步调用
-                    .call()
-                    .chatResponse();
-
-            // 记录本次回复所基于的工具调用（工具调用信息在 AssistantMessage 的 toolCalls 中）
-            chatResponse.getResults().forEach(result -> {
-                org.springframework.ai.chat.messages.AssistantMessage output = result.getOutput();
-                // 判断输出是否为空，避免空指针异常 以及 判断 toolCalls 是否为空，避免空指针异常
-                // 注意output.getToolCalls()不是指代的工具调用，而是指代的这里的对象是否被创建
-                if (output != null && output.getToolCalls() != null) {
-                    // 获取工具调用名称
-                    output.getToolCalls().forEach(tc -> invokedTools.add(tc.name()));
+            // 2次重试
+            for (int i = 0; i < 3; i++) {
+                try {
+                // 调用 LLM
+                    ChatResponse chatResponse = callModel(primaryChatClient, messages, session.getId(), invokedTools);
+                // 记录本次回复所基于的工具调用（工具调用信息在 AssistantMessage 的 toolCalls 中）
+                chatResponse.getResults().forEach(result -> {
+                    AssistantMessage output = result.getOutput();
+                    // 判断输出是否为空，避免空指针异常 以及 判断 toolCalls 是否为空，避免空指针异常
+                    // 注意output.getToolCalls()不是指代的工具调用，而是指代的这里的对象是否被创建
+                    if (output != null && output.getToolCalls() != null) {
+                        // 获取工具调用名称
+                        output.getToolCalls().forEach(tc -> invokedTools.add(tc.name()));
+                    }
+                });
+                // 获取最终回复
+                reply = chatResponse.getResult() != null ? chatResponse.getResult().getOutput().getText() : null;
+                if (reply != null && !reply.isBlank()) {
+                    log.info("会话 {} 获取到回复: {}", session.getId(), reply);
+                    success = true;
+                    break;
                 }
-            });
-            // 获取最终回复
-            reply = chatResponse.getResult() != null ? chatResponse.getResult().getOutput().getText() : null;
-        } catch (Exception e) {
+            }
+                catch (Exception e) {
+                    log.warn("第 {} 次调用 LLM 失败,重试中...", i+1, e);
+                }
+            }
+            if (!success) {
+                try {
+                    // 添加降级处理更换其他模型
+                    ChatResponse chatResponse = callModel(backupChatClient, messages, session.getId(), invokedTools);
+                    if (chatResponse != null && chatResponse.getResult() != null ){
+                        log.info("会话 {} 获取到回复: {},来自备用模型", session.getId(), chatResponse);
+                        reply = chatResponse.getResult().getOutput().getText();
+                        success = true;
+                    }
+                }
+                catch (Exception e) {
+                    log.error("LLM 调用失败: sessionId={}", session.getId(), e);
+                }
+            }
+            if (!success) {
+                reply = "抱歉，AI 服务暂时不可用，请稍后重试。";
+            }
+        }catch (Exception e) {
             log.error("LLM 调用失败: sessionId={}", session.getId(), e);
             reply = "抱歉，AI 服务暂时不可用，请稍后重试。";
         } finally {
@@ -183,7 +213,8 @@ public class ChatServiceImpl implements ChatService {
         }
 
         try {
-            ChatResponse summaryResponse = chatClient.prompt()
+            // 调用摘要生成模型
+            ChatResponse summaryResponse = primaryChatClient.prompt()
                     .messages(summaryMessages)
                     .system(PromptEnum.SUMMARY_GENERATION.getContent())
                     .call()
@@ -421,4 +452,25 @@ public class ChatServiceImpl implements ChatService {
         }
         return sb.toString();
     }
+    /**
+     * 调用模型
+     * @param chatClient ChatClient
+     * @param messages 消息列表
+     * @param sessionId 会话ID
+     * @param invokedTools 调用的工具列表
+     * @return 模型返回的消息
+     */
+    private ChatResponse callModel(ChatClient chatClient,
+                             List<Message> messages,
+                             Long sessionId,
+                             List<String> invokedTools) {
+        log.info("会话 {} 调用模型, messages={}, invokedTools={}", sessionId, messages, invokedTools);
+        ChatResponse response = chatClient.prompt()
+                .messages(messages)
+                .toolContext(Map.of("sessionId", sessionId))
+                .call()
+                .chatResponse();
+        return response;
+    }
 }
+
