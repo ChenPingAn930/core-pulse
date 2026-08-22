@@ -217,6 +217,21 @@ corepulse-user：用户相关功能
 7. DeepSeek API Key
 8. 阿里百炼 API Key（LLM 备用模型和 RAG Embedding 使用）
 
+### 第三方工具下载说明
+
+> **版权说明**：本项目代码采用 MIT 许可开源，但 `tool/` 目录下的第三方工具均为闭源或受各自许可证约束的软件，**不随项目分发**（已加入 `.gitignore`）。请从官方地址自行下载，并按官方许可使用。
+
+| 工具 | 用途 | 官方下载地址 | 许可证 |
+|---|---|---|---|
+| smartmontools | 磁盘 S.M.A.R.T. 检测 | https://github.com/smartmontools/smartmontools/releases | 开源（GPL） |
+| CrystalDiskMark | 磁盘性能测试 | https://crystalmark.info/en/software/crystaldiskmark/ | 闭源免费，遵循官方许可 |
+| FurMark | 显卡压力测试 | https://geeks3d.com/furmark/ | 闭源，遵循官方 EULA |
+| CPU-Z | CPU 和主板信息 | https://www.cpuid.com/softwares/cpu-z.html | 闭源免费，遵循官方 EULA |
+| Core Temp | CPU 温度监控 | https://www.alcpu.com/CoreTemp/ | 闭源，遵循官方 EULA |
+| VC++ Redistributable | 运行库修复 | https://aka.ms/vs/17/release/vc_redist.x64.exe | 微软软件，遵循微软许可条款 |
+
+下载后请将各工具按 `tool/` 目录下的对应路径放置（如 `tool/disk-tools/smartmontools/bin/smartctl.exe`），或通过后端的"一键准备"功能自动下载。
+
 ### 环境变量
 
 请通过 IDEA 的运行配置或系统环境变量配置，不要把真实密钥提交到 Git：
