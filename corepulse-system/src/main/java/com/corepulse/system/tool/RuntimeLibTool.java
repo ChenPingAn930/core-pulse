@@ -45,7 +45,7 @@ public class RuntimeLibTool implements SystemTool {
             "$paths='HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*';",
             "Get-ItemProperty $paths -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Microsoft Visual C++*' } | ForEach-Object { $installed += [pscustomobject]@{ name=$_.DisplayName; version=$_.DisplayVersion } };",
             "$runtimes=@{};",
-            "foreach($arch in 'x64','x86'){ $p=\"HKLM:\\SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\$arch\"; if(Test-Path $p){ $runtimes[$arch]=(Get-ItemProperty $p).Version } };",
+            "foreach($arch in 'x64','x86'){ $paths=@(\"HKLM:\\SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\$arch\",\"HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\$arch\"); foreach($p in $paths){ if(Test-Path $p){ $item=Get-ItemProperty $p; $runtimes[$arch]=[pscustomobject]@{ version=$item.Version; installed=$item.Installed; path=$p }; break } } };",
             "$dlls=@();",
             "$sys32=[Environment]::GetFolderPath('System');",
             "$wow64=\"$env:windir\\SysWOW64\";",

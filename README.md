@@ -146,7 +146,7 @@ corepulse-user：用户相关功能
 | 工具 | 作用 |
 |---|---|
 | `startCpuStress` / `getCpuStressStatus` / `stopCpuStress` | CPU 压测、状态查询和停止 |
-| `startMemStress` / `getMemStressStatus` / `stopMemStress` | 使用 `Testlimit64.exe` 进行内存压力测试、状态查询和停止 |
+| `startMemStress` / `getMemStressStatus` / `stopMemStress` | 使用独立 Java 进程进行内存压力测试、状态查询和停止 |
 | `startFurMark` | 使用 FurMark 进行显卡压力测试，并支持自动结束 |
 
 内存压力测试会明显占用系统资源，必须先向用户说明风险并取得明确确认。所有后台压测都应保留任务 ID，停止时调用对应的停止工具，不能只向用户回复“已停止”。
@@ -200,7 +200,7 @@ corepulse-user：用户相关功能
 | RabbitMQ | 异步任务、延迟终止和消息调度 |
 | MyBatis-Plus | 数据访问 |
 | WebSocket | 长任务进度实时推送 |
-| Windows 本地工具 | FurMark、Testlimit、CPU-Z、GPU-Z 等真实检测工具 |
+| Windows 本地工具 | FurMark、CPU-Z、GPU-Z、Core Temp、smartctl 等真实检测工具 |
 
 ---
 
@@ -280,7 +280,7 @@ mvn -pl corepulse-web -am spring-boot:run
 - [x] Function Calling 工具注册与调用
 - [x] OSHI 真实硬件信息采集
 - [x] CPU、内存、显卡压力测试任务
-- [x] Testlimit 内存压力测试接入
+- [x] Java 独立进程内存压力测试
 - [x] Redis 任务状态管理
 - [x] RabbitMQ 异步调度与延迟终止
 - [x] WebSocket 实时进度推送

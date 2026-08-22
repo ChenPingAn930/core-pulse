@@ -8,17 +8,14 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
  * 内存压力测试工具
  * <p>
- * 通过 Sysinternals Testlimit（-d 参数真正占用物理内存）对内存施加压力，
- * 消耗物理内存总量的 70%（保留 30% 给系统），纳入任务系统管理。
+ * 通过 Java 进程内部持续分配和读写字节数组对内存施加压力，
+ * 目标消耗物理内存总量的 70%（同时受 JVM 最大堆限制），纳入任务系统管理。
  * <p>
  * 安全策略（重要）：
  * 内存压测是<b>高危操作</b>（高内存占用可能导致系统卡顿、程序无响应），
@@ -39,7 +36,7 @@ public class MemStressTool implements SystemTool {
 
     @Override
     public String toolDescription() {
-        return "内存压力测试：用 Testlimit 消耗物理内存的70%进行压测，高危操作必须用户确认后才启动，可查询占用率、手动停止，默认30分钟";
+        return "内存压力测试：由 Java 内部持续分配和读写内存进行压测，目标占用物理内存约70%且受 JVM 最大堆限制，高危操作必须用户确认后才启动，可查询占用率、手动停止，默认30分钟";
     }
 
     /**
@@ -79,7 +76,7 @@ public class MemStressTool implements SystemTool {
             var task = taskService.startTask("memstress", params, sessionId);
             log.info("内存压测任务已创建: taskId={}", task.getId());
             return "内存压力测试已启动（用户已确认），时长 " + minutes + " 分钟，taskId=" + task.getId()
-                    + "。将通过 Testlimit 消耗约70%物理内存。可用 getMemStressStatus 查询实时内存占用率，或用 stopMemStress 提前停止。";
+                    + "。将由 Java 内部消耗约70%物理内存（受 JVM 最大堆限制）。可用 getMemStressStatus 查询实时内存占用率，或用 stopMemStress 提前停止。";
         } catch (Exception e) {
             log.error("启动内存压测失败", e);
             return "内存压测启动失败：" + e.getMessage();
@@ -115,7 +112,7 @@ public class MemStressTool implements SystemTool {
      * @param taskId 压测任务 ID
      * @return 停止结果
      */
-    @Tool(name = "stopMemStress", description = "停止内存压测任务，释放内存（必须调用本工具才能真正终止 Testlimit 进程并释放内存）。当用户要求停止压测、关闭压测、结束压测时，必须调用本工具，绝不能只回复文字而不调用。taskId 为 startMemStress 返回的任务 ID，可从对话历史中获得。停止后本工具会验证 Testlimit 进程是否真正清理，若未清理会明确告知。")
+    @Tool(name = "stopMemStress", description = "停止内存压测任务并释放独立 Java 压测进程占用的内存。当用户要求停止压测、关闭压测、结束压测时，必须调用本工具，绝不能只回复文字而不调用。taskId 为 startMemStress 返回的任务 ID，可从对话历史中获得。")
     public String stopMemStress(
             @ToolParam(description = "压测任务 ID（由 startMemStress 返回）") Long taskId) {
         log.info("调用工具: stopMemStress，停止内存压测，taskId={}", taskId);
@@ -124,50 +121,12 @@ public class MemStressTool implements SystemTool {
         }
         try {
             taskService.stopTask(taskId);
-            // 停止后验证 Testlimit 进程是否真正清理（等待清理命令执行完成）
-            try {
-                Thread.sleep(2000);
-            } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
-            }
-            boolean testlimitLeft = isTestlimitRunning();
-            if (testlimitLeft) {
-                log.warn("内存压测停止后仍有 Testlimit 进程残留");
-                return "内存压测已停止，taskId=" + taskId + "，但仍有 Testlimit 进程未清理干净！"
-                        + "请再次调用 stopMemStress 重试，或提醒用户手动结束 Testlimit64 进程以释放内存。";
-            }
-            log.info("内存压测停止成功，Testlimit 进程已清理，内存已释放，taskId={}", taskId);
-            return "内存压测已停止，taskId=" + taskId + "。已验证 Testlimit 进程全部清理，内存已释放。";
+            log.info("内存压测停止成功，独立 Java 进程已清理，内存已释放，taskId={}", taskId);
+            return "内存压测已停止，taskId=" + taskId + "。独立 Java 压测进程已清理，内存已释放。";
         } catch (Exception e) {
             log.error("停止内存压测失败", e);
             return "停止失败：" + e.getMessage();
         }
     }
 
-    /**
-     * 检测 Testlimit 进程是否仍存活（用于验证清理是否成功）
-     */
-    private boolean isTestlimitRunning() {
-        try {
-            String cmd = "@(Get-Process -Name Testlimit64 -ErrorAction SilentlyContinue).Count";
-            ProcessBuilder pb = new ProcessBuilder("powershell.exe", "-NoProfile", "-ExecutionPolicy",
-                    "Bypass", "-Command", cmd);
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
-                String line = reader.readLine();
-                while (line != null && line.isBlank()) {
-                    line = reader.readLine();
-                }
-                if (line != null) {
-                    return Integer.parseInt(line.trim()) > 0;
-                }
-            }
-            process.waitFor();
-        } catch (Exception e) {
-            log.warn("检测 Testlimit 进程失败: {}", e.getMessage());
-        }
-        return false;
-    }
 }

@@ -17,12 +17,6 @@ public class ToolPathConfig {
     /** 显卡烤机（FurMark） */
     private String furmarkPath = "./tool/烤鸡工具/FurMark/FurMark.exe";
 
-    /** 内存压力测试（Sysinternals Testlimit） */
-    private String testlimitPath = "./tool/内存工具/Testlimit/Testlimit64.exe";
-
-    /** CPU 压力测试（Prime95） */
-    private String prime95Path = "./tool/处理器工具/Prime95/prime95.exe";
-
     /** CPU 温度监控（Core Temp） */
     private String coreTempPath = "./tool/处理器工具/CoreTemp/Core Temp x64.exe";
 

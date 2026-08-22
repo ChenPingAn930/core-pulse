@@ -42,5 +42,5 @@ Thumbs.db
 Everything.db
 Everything.ini
 
-# 大型运行时/安装包（超过 Gitee 100MB 单文件限制，应自行下载或存云盘）
-tool/运行库/*.exe
+# 第三方工具（闭源软件，版权原因不入库，由用户通过"一键准备"功能从官方地址下载）
+tool/

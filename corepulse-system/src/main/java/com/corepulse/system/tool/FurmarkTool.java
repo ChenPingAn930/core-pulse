@@ -25,9 +25,7 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class FurmarkTool implements SystemTool {
 
-    /** FurMark 可执行文件路径（默认指向项目 tool 目录） */
-    @Value("${corepulse.tool.furmark-path:./tool/烤鸡工具/FurMark/FurMark.exe}")
-    private String furmarkExePath;
+    private final ToolPathConfig toolPath;
 
     /** 烤机默认时长（分钟） */
     @Value("${corepulse.tool.furmark-default-minutes:30}")
@@ -68,7 +66,7 @@ public class FurmarkTool implements SystemTool {
                 ? (Long) toolContext.getContext().get("sessionId")
                 : null;
         log.info("调用工具: startFurMark，开始启动显卡烤机，时长={}分钟", minutes);
-        File exe = new File(furmarkExePath);
+        File exe = new File(toolPath.getFurmarkPath());
 
         // 1. 启动真实 FurMark.exe 进程（绕过 start.bat 的 pause）
         Process process = null;
@@ -109,6 +107,6 @@ public class FurmarkTool implements SystemTool {
         ProcessManager.register(taskId, process);
 
         return "显卡烤机已启动，测试时长 " + minutes + " 分钟，taskId=" + taskId
-                + "。30 分钟后将自动关闭。";
+                + "。测试结束后将自动关闭。";
     }
 }

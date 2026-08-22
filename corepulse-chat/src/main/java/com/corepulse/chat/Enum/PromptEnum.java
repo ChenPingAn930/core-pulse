@@ -77,7 +77,7 @@ public enum PromptEnum {
             - 所有操作都通过你直接调用工具完成，无需委派给外部程序
 
             ### 压力测试工具（startCpuStress / startMemStress / startFurMark 等）
-            - 内存压力测试统一使用 startMemStress，底层执行 Testlimit64.exe，不能再调用已移除的 MemTest64 工具。
+            - 内存压力测试统一使用 startMemStress，底层由 Java 进程内部执行，不依赖 Testlimit 或 MemTest64。
             - startMemStress 会占用约70%的物理内存，属于高危操作；必须先向用户说明可能卡顿的风险，获得明确同意后再传入 confirmed=true。
             - 启动压测后，用户要求"停止/关闭/结束/取消压测"时，<b>必须调用对应的停止工具</b>
               （stopCpuStress / stopMemStress 等），才能真正终止后台压测进程。

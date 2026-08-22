@@ -14,9 +14,9 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 import java.io.BufferedReader;
-import java.io.File;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.io.File;
 import java.time.LocalDateTime;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -30,8 +30,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * 内存压力测试执行器
  * <p>
- * 通过 Sysinternals Testlimit（-d 参数真正占用物理内存）对内存施加压力，
- * 消耗量为物理内存总量的 70%（保留 30% 给系统，避免死机）。
+ * 通过独立 Java 子进程持续读写内存，目标让系统总内存占用达到约 70%。
  * 每秒读取真实内存占用率（wmic）写入 Redis + WebSocket 推送。
  */
 @Slf4j
@@ -44,10 +43,6 @@ public class MemStressTaskExecutor implements ToolTaskExecutor {
     private final TaskEventPublisher eventPublisher;
     private final ObjectMapper objectMapper;
 
-    /** Testlimit 可执行文件路径（由配置注入，默认指向项目 tool 目录） */
-    @Value("${corepulse.tool.testlimit-path:./tool/内存工具/Testlimit/Testlimit64.exe}")
-    private String testlimitPath;
-
     /** 内存消耗上限占物理内存总量的比例（70%） */
     @Value("${corepulse.memtest.ratio:0.7}")
     private double memoryRatio;
@@ -55,6 +50,7 @@ public class MemStressTaskExecutor implements ToolTaskExecutor {
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
     private final Map<Long, ScheduledFuture<?>> runningTasks = new ConcurrentHashMap<>();
     private final Map<Long, Long> taskSessions = new ConcurrentHashMap<>();
+    private final Map<Long, Process> memoryStressProcesses = new ConcurrentHashMap<>();
 
     @Override
     public String taskType() {
@@ -73,19 +69,25 @@ public class MemStressTaskExecutor implements ToolTaskExecutor {
 
         taskSessions.put(taskId, task.getSessionId());
 
-        // 启动 Testlimit 消耗内存
-        boolean started = startTestlimit();
+        // 使用独立 JVM 分配并持续读写内存，避免受 Web 应用自身堆限制
+        boolean started = startJavaMemoryStress(taskId);
 
         int durationSec = parseDurationSec(task);
         AtomicInteger elapsed = new AtomicInteger(0);
         ScheduledFuture<?> future = scheduler.scheduleAtFixedRate(
                 () -> tick(taskId, elapsed, durationSec), 0, 1, TimeUnit.SECONDS);
         runningTasks.put(taskId, future);
-        log.info("内存压测任务启动: taskId={}, durationSec={}, Testlimit启动={}", taskId, durationSec, started);
+        log.info("内存压测任务启动: taskId={}, durationSec={}, Java内存压测启动={}", taskId, durationSec, started);
     }
 
     private void tick(Long taskId, AtomicInteger elapsed, int durationSec) {
         int sec = elapsed.incrementAndGet();
+        Process process = memoryStressProcesses.get(taskId);
+        if (process == null || !process.isAlive()) {
+            log.error("内存压测子进程提前退出: taskId={}", taskId);
+            stop(taskId, TaskStatus.FAILED);
+            return;
+        }
         double memLoad = readMemUsage();
         int progress = (int) Math.min(100, sec * 100.0 / durationSec);
 
@@ -119,7 +121,7 @@ public class MemStressTaskExecutor implements ToolTaskExecutor {
         }
         Long sessionId = taskSessions.remove(taskId);
 
-        killTestlimit();
+        stopJavaMemoryStress(taskId);
 
         ToolTask task = taskMapper.selectById(taskId);
         if (task == null || !TaskStatus.RUNNING.name().equals(task.getStatus())) {
@@ -130,7 +132,7 @@ public class MemStressTaskExecutor implements ToolTaskExecutor {
         }
 
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("conclusion", "内存压力测试已结束，Testlimit 进程已清理，内存已释放。");
+        result.put("conclusion", "内存压力测试已结束，独立 Java 压测进程已停止，内存已释放。");
         task.setStatus(finalStatus.name());
         task.setResult(toJson(result));
         task.setFinishedAt(LocalDateTime.now());
@@ -142,49 +144,67 @@ public class MemStressTaskExecutor implements ToolTaskExecutor {
     }
 
     /**
-     * 启动 Testlimit 消耗物理内存总量的 70%
-     * <p>
-     * 使用 -d 参数（泄漏并触摸内存，真正占用物理内存），-c 1 限制只分配一次，
-     * 避免 Testlimit 默认"尽可能多"导致内存耗尽。
+     * 启动独立 JVM 内存压测进程。子进程使用自身堆，不受 Web 应用 -Xmx 限制。
      */
-    private boolean startTestlimit() {
+    private boolean startJavaMemoryStress(Long taskId) {
+        long physicalMb = readTotalMemoryMb();
+        long currentUsedMb = Math.round(physicalMb * readMemUsage() / 100.0);
+        long desiredUsedMb = Math.round(physicalMb * memoryRatio);
+        long targetMb = Math.max(256, desiredUsedMb - currentUsedMb);
+        long heapMb = targetMb + Math.max(1024, Math.round(targetMb * 0.1));
         try {
-            long totalMb = readTotalMemoryMb();
-            long toAllocateMb = Math.max(1, Math.round(totalMb * memoryRatio));
-            File exe = new File(testlimitPath);
-            if (!exe.exists()) {
-                log.error("Testlimit 不存在: {}", testlimitPath);
-                return false;
-            }
-            ProcessBuilder pb = new ProcessBuilder(
-                    exe.getAbsolutePath(),
-                    "-accepteula", "-d", String.valueOf(toAllocateMb), "-c", "1");
-            pb.directory(exe.getParentFile());
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-            log.info("Testlimit 已启动: 总内存={}MB, 消耗={}MB, pid={}", totalMb, toAllocateMb, process.pid());
+            String javaCommand = new File(System.getProperty("java.home"), "bin/java.exe").getAbsolutePath();
+            String classpath = System.getProperty("java.class.path");
+            ProcessBuilder builder = new ProcessBuilder(
+                    javaCommand,
+                    "-Xms" + Math.min(512, heapMb) + "m",
+                    "-Xmx" + heapMb + "m",
+                    "-cp", classpath,
+                    MemoryStressWorker.class.getName(),
+                    String.valueOf(targetMb));
+            builder.redirectErrorStream(true);
+            Process process = builder.start();
+            Thread outputReader = new Thread(() -> readWorkerOutput(taskId, process),
+                    "corepulse-memstress-output-" + taskId);
+            outputReader.setDaemon(true);
+            outputReader.start();
+            memoryStressProcesses.put(taskId, process);
+            log.info("Java 独立内存压测已启动: taskId={}, 物理内存={}MB, 当前已用={}MB, 目标新增={}MB, 子进程堆={}MB, pid={}",
+                    taskId, physicalMb, currentUsedMb, targetMb, heapMb, process.pid());
             return true;
         } catch (Exception e) {
-            log.error("启动 Testlimit 失败: {}", e.getMessage());
+            log.error("启动 Java 独立内存压测失败", e);
             return false;
         }
     }
 
-    /**
-     * 终止 Testlimit 进程，释放内存
-     */
-    private void killTestlimit() {
-        try {
-            String cmd = "Stop-Process -Name Testlimit64 -Force -ErrorAction SilentlyContinue";
-            ProcessBuilder pb = new ProcessBuilder("powershell.exe", "-NoProfile", "-ExecutionPolicy",
-                    "Bypass", "-Command", cmd);
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-            process.waitFor();
-            log.info("Testlimit 进程已清理");
+    private void readWorkerOutput(Long taskId, Process process) {
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                log.warn("内存压测子进程输出: taskId={}, {}", taskId, line);
+            }
         } catch (Exception e) {
-            log.warn("清理 Testlimit 进程失败: {}", e.getMessage());
+            log.debug("读取内存压测子进程输出结束: taskId={}, {}", taskId, e.getMessage());
         }
+    }
+
+    /** 停止子进程并释放其全部内存。 */
+    private void stopJavaMemoryStress(Long taskId) {
+        Process process = memoryStressProcesses.remove(taskId);
+        if (process != null && process.isAlive()) {
+            process.destroy();
+            try {
+                if (!process.waitFor(3, TimeUnit.SECONDS) && process.isAlive()) {
+                    process.destroyForcibly();
+                }
+            } catch (InterruptedException e) {
+                process.destroyForcibly();
+                Thread.currentThread().interrupt();
+            }
+        }
+        log.info("Java 独立内存压测进程已清理: taskId={}", taskId);
     }
 
     /**
