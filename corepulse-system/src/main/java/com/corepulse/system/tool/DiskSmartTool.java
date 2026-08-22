@@ -79,7 +79,7 @@ public class DiskSmartTool implements SystemTool {
         if (!exe.exists()) {
             log.error("smartctl 不存在: {}", exe.getAbsolutePath());
             return "检测失败：未找到 smartctl 工具，路径=" + exe.getAbsolutePath()
-                    + "。请确认 smartmontools 已安装到 tool/硬盘工具/smartmontools。";
+                    + "。请确认 smartmontools 已安装到 tool/disk-tools/smartmontools。";
         }
         try {
             java.util.List<String> command = new java.util.ArrayList<>();

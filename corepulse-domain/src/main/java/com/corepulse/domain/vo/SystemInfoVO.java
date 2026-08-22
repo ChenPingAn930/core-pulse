@@ -37,6 +37,9 @@ public class SystemInfoVO {
     /** CPU 温度（摄氏度，如 56.0，硬件不支持时为 null） */
     private Double cpuTemp;
 
+    /** GPU 温度（摄氏度，如 62.0，硬件不支持时为 null） */
+    private Double gpuTemp;
+
     /** 磁盘健康状态，枚举：HEALTHY / WARNING */
     private String diskHealth;
 }

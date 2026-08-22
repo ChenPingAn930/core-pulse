@@ -2,12 +2,14 @@ package com.corepulse.system.service.impl;
 
 import com.corepulse.domain.vo.SystemInfoVO;
 import com.corepulse.system.service.SystemInfoService;
+import com.corepulse.system.tool.GpuTemperatureReader;
 import lombok.extern.slf4j.Slf4j;
 import oshi.SystemInfo;
 import oshi.hardware.CentralProcessor;
 import oshi.hardware.GlobalMemory;
 import oshi.hardware.HardwareAbstractionLayer;
 import oshi.software.os.OperatingSystem;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.math.RoundingMode;
@@ -24,6 +26,9 @@ public class SystemInfoServiceImpl implements SystemInfoService {
     private final SystemInfo systemInfo = new SystemInfo();
     private final HardwareAbstractionLayer hal = systemInfo.getHardware();
     private final OperatingSystem os = systemInfo.getOperatingSystem();
+
+    @Autowired
+    private GpuTemperatureReader gpuTemperatureReader;
 
     @Override
     public SystemInfoVO getSystemInfo() {
@@ -245,6 +250,12 @@ public class SystemInfoServiceImpl implements SystemInfoService {
         double temp = hal.getSensors().getCpuTemperature();
         if (temp > 0) {
             vo.setCpuTemp(round(temp));
+        }
+
+        // GPU 温度（NVIDIA 用 nvidia-smi，AMD 用 WMI，读不到则为 null）
+        Double gpuTemp = gpuTemperatureReader.readGpuTemperature();
+        if (gpuTemp != null) {
+            vo.setGpuTemp(round(gpuTemp));
         }
 
         // 磁盘健康状态

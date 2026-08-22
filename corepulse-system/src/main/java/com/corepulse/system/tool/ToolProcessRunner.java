@@ -93,7 +93,7 @@ public final class ToolProcessRunner {
             }
             // 用 PowerShell Start-Process -Verb RunAs 提权启动，目录切换到 exe 所在目录
             String psCommand = String.format(
-                    "Start-Process -FilePath '%s' -WorkingDirectory '%s'%s",
+                    "Start-Process -FilePath '%s' -WorkingDirectory '%s' -Verb RunAs%s",
                     exe.getAbsolutePath(), exe.getParentFile().getAbsolutePath(), argStr);
             ProcessBuilder pb = new ProcessBuilder("powershell.exe", "-NoProfile", "-Command", psCommand);
             pb.redirectErrorStream(true);

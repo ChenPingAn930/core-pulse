@@ -18,19 +18,18 @@ public class ToolPathConfig {
     private String furmarkPath = "./tool/烤鸡工具/FurMark/FurMark.exe";
 
     /** CPU 温度监控（Core Temp） */
-    private String coreTempPath = "./tool/处理器工具/CoreTemp/Core Temp x64.exe";
+    private String coreTempPath = "./tool/处理器工具/CoreTemp/Core Temp.exe";
 
     /** CPU 信息（CPU-Z） */
     private String cpuzPath = "./tool/处理器工具/CPUZ/cpuz_x64.exe";
 
     /** 硬盘健康检测（smartmontools smartctl） */
-    private String smartctlPath = "./tool/硬盘工具/smartmontools/bin/smartctl.exe";
+    private String smartctlPath = "./tool/disk-tools/smartmontools/bin/smartctl.exe";
 
     /** 硬盘测速（CrystalDiskMark） */
-    private String crystalDiskMarkPath = "./tool/硬盘工具/CrystalDiskMark/DiskMark64S.exe";
+    private String crystalDiskMarkPath = "./tool/disk-tools/CrystalDiskMark/DiskMark64.exe";
 
-    /** GPU 信息（GPU-Z） */
-    private String gpuzPath = "./tool/显卡工具/GPUZ/GPU-Z.exe";
+    
 
     /** VC++ 运行库离线安装包（64位） */
     private String vcRedistX64Path = "./tool/运行库/vc_redist.x64.exe";

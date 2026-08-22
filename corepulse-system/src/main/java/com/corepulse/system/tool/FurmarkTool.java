@@ -77,11 +77,12 @@ public class FurmarkTool implements SystemTool {
             }
             ProcessBuilder pb = new ProcessBuilder(
                     exe.getAbsolutePath(),
-                    "/nogui",
-                    "/width=1280",
-                    "/height=720",
-                    "/run_mode=1",
-                    "/max_time=" + (minutes * 60_000L));
+                    "--demo", "furmark-gl",
+                    "--benchmark",
+                    "--width", "1280",
+                    "--height", "720",
+                    "--max-time", String.valueOf(minutes * 60),
+                    "--no-score-box");
             pb.directory(exe.getParentFile());
             process = pb.start();
             log.info("FurMark 进程已启动: pid={}, durationMin={}, sessionId={}", process.pid(), minutes, sessionId);
