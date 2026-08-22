@@ -35,9 +35,6 @@ public class ToolPathConfig {
     /** 硬盘测速（CrystalDiskMark） */
     private String crystalDiskMarkPath = "./tool/硬盘工具/CrystalDiskMark/DiskMark64S.exe";
 
-    /** 综合检测（AIDA64） */
-    private String aida64Path = "./tool/综合检测/AIDA64/aida64.exe";
-
     /** GPU 信息（GPU-Z） */
     private String gpuzPath = "./tool/显卡工具/GPUZ/GPU-Z.exe";
 
