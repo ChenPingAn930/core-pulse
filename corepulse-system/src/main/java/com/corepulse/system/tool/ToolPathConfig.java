@@ -17,9 +17,6 @@ public class ToolPathConfig {
     /** 显卡烤机（FurMark） */
     private String furmarkPath = "./tool/烤鸡工具/FurMark/FurMark.exe";
 
-    /** 内存测试（MemTest64） */
-    private String memtestPath = "./tool/内存工具/memtest64/MemTest64.exe";
-
     /** 内存压力测试（Sysinternals Testlimit） */
     private String testlimitPath = "./tool/内存工具/Testlimit/Testlimit64.exe";
 

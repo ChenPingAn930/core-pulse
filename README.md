@@ -1,110 +1,313 @@
 # CorePulse · AI 电脑智能维修助手
+<strong><font color="red">注意：这个项目目前仍处于开发中，欢迎 star 和 fork，但请勿用于生产环境，并且风险自负。</font></strong>
+> 一个面向普通用户的本地电脑智能诊断与维修助手后端。
+>
+> **LLM 负责理解与决策，Java 后端负责控制与执行，真实系统工具负责提供结果。**
 
-LLM 决策层(大脑)+ 工具执行层(工具臂)架构的智能维修系统后端。
+CorePulse 不是只会聊天的问答程序，而是一个可以感知本机状态、调用诊断工具、执行压力测试、检索维修知识，并在高风险操作前征求用户确认的智能体系统。
 
-基于真实硬件采集与真实工具执行，AI 能查配置、测性能、诊断故障、修复问题。
+---
 
-## 模块结构(微服务演进友好)
+## 一、开发初衷
 
-| 模块 | 职责 | 将来可拆为 |
-|---|---|---|
-| corepulse-common | 统一响应/异常/常量 | 公共 jar |
-| corepulse-domain | entity / vo / dto(与 database_schema.sql 对齐) | 共享 jar |
-| corepulse-llm | LlmClient 接口 + DeepSeek 实现 + 函数注册表 | LLM 网关服务 |
-| corepulse-chat | 会话/消息/AI 对话编排(function calling)/RAG 知识库 | chat-service |
-| corepulse-task | 任务状态机/MQ(死信延迟队列)/执行器 | task-service |
-| corepulse-system | 系统工具执行层（信息采集/压测/诊断/修复） | system-service |
-| corepulse-web | 启动类/WebSocket/配置聚合 | 网关 |
+电脑出现蓝屏、卡顿、温度过高、磁盘空间不足或程序缺少运行库时，普通用户通常不知道：
 
-## 启动前依赖
+- 问题究竟出在哪里；
+- 哪些检测结果真正重要；
+- 某个维修操作会不会带来数据风险；
+- 维修人员给出的方案是否必要。
 
-1. **MySQL 8.0+**: 执行 `../设计文档/database_schema.sql` 建库建表
-2. **Redis**: 默认 localhost:6379
-3. **RabbitMQ**: 默认 localhost:5672(guest/guest)
-   - Docker: `docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management`
-   - 或本机安装 Erlang + RabbitMQ
-4. **DeepSeek API Key**: 配置在 `corepulse-web/src/main/resources/application.yml` 的 `corepulse.llm.api-key`(或环境变量 `DEEPSEEK_API_KEY`)
+CorePulse 的目标是把电脑维修过程变得**透明、可解释、可控**：
+0. 因为作者曾到线下电脑城做维修工作，发现其实很大部分维修工作都是重复的，并且价格昂贵，所以想通过 AI 来辅助维修，当然如果硬件损伤，仍然需要专业人员处理。
+1. 用户用自然语言描述问题，不必记忆复杂命令。
+2. AI 根据场景选择合适的系统工具，而不是直接猜测结论。
+3. 后端对危险操作进行拦截、确认和执行控制。
+4. AI 将原始检测数据整理成普通用户能够理解的建议。
 
-## 启动
+这是一个从 Java 后端、Spring Boot、Spring AI、消息队列和操作系统工具实践智能体开发的学习型项目，也是一套可以继续演进为桌面维修产品的后端基础。
 
+---
+
+## 二、项目特色
+
+### 1. LLM + 工具执行层
+
+LLM 负责意图识别、工具选择、参数生成和结果解释；工具层负责实际访问操作系统、读取硬件状态或启动本地程序。
+
+```text
+用户问题
+   ↓
+对话编排与上下文管理
+   ↓
+主 LLM 决策 ──失败──> 备用 LLM
+   ↓
+Function Calling 工具调用
+   ↓
+系统信息采集 / 检测 / 压测 / 修复
+   ↓
+结果回传与诊断解释
 ```
-# IDEA: 打开根目录 CorePulse, 运行 com.corepulse.CorePulseApplication
-# 或命令行:
+
+### 2. 主模型与备用模型降级
+
+项目使用 OpenAI 兼容协议接入不同模型服务：
+
+- 主模型：DeepSeek
+- 备用模型：阿里百炼兼容接口中的 Qwen
+
+当主模型请求失败时，后端可以切换到备用模型，减少单一模型服务不可用对系统的影响。
+
+### 3. 真实工具执行
+
+系统不是返回模拟数据，而是通过 OSHI、`ProcessBuilder` 和本地工具获取或执行真实结果，包括硬件信息、磁盘状态、温度、运行库和压力测试等。
+
+### 4. 同步工具与异步任务分离
+
+- 硬件查询、磁盘空间检查等秒级操作：同步执行。
+- CPU、内存、显卡压力测试等耗时操作：创建后台任务，支持状态查询、进度推送和主动停止。
+
+### 5. 安全确认机制
+
+涉及删除、修复、卸载、压力测试或终端命令的操作，不能只依赖模型判断：
+
+```text
+识别意图 → 生成执行计划 → 说明风险 → 用户确认 → 后端执行 → 返回结果
+```
+
+危险命令需要展示命令内容并获得明确确认；高风险或明确禁止的操作由后端拦截。
+
+### 6. RAG 维修知识库
+
+系统可以从本地维修知识文档构建向量数据，在对话时检索相关知识片段，辅助 AI 进行故障分析和维修建议生成。
+
+---
+
+## 三、架构设计
+
+```text
+┌──────────────────────────────────────────────┐
+│ 用户 / 前端                                    │
+│ 自然语言对话 · 工具卡片 · 实时进度              │
+└──────────────────────┬───────────────────────┘
+                       │ HTTP / WebSocket
+                       ▼
+┌──────────────────────────────────────────────┐
+│ corepulse-web                                  │
+│ 启动类 · Web 接口 · WebSocket · 配置聚合        │
+└──────────────────────┬───────────────────────┘
+                       ▼
+┌──────────────────────────────────────────────┐
+│ corepulse-chat                                 │
+│ 会话管理 · LLM 调用 · Function Calling · RAG   │
+└───────────────┬──────────────────┬─────────────┘
+                │                  │
+                ▼                  ▼
+┌──────────────────────┐  ┌─────────────────────┐
+│ corepulse-system      │  │ corepulse-task       │
+│ 系统采集与工具执行     │  │ 任务状态与异步调度     │
+└──────────────────────┘  └─────────────────────┘
+                │                  │
+                ▼                  ▼
+       OSHI / 本地工具       Redis / RabbitMQ
+
+corepulse-common：公共响应、异常与常量
+corepulse-domain：实体、DTO、VO 和数据模型
+corepulse-user：用户相关功能
+```
+
+### 模块职责
+
+| 模块 | 主要职责 |
+|---|---|
+| `corepulse-common` | 统一响应、异常处理、公共常量 |
+| `corepulse-domain` | Entity、DTO、VO 和领域数据模型 |
+| `corepulse-chat` | 会话、消息、模型调用、工具编排、RAG |
+| `corepulse-task` | 任务状态、后台执行、Redis 状态、RabbitMQ 调度 |
+| `corepulse-system` | OSHI 信息采集、本地工具、压测、检测和修复 |
+| `corepulse-user` | 用户相关领域功能 |
+| `corepulse-web` | Spring Boot 启动入口、Web 层和统一配置 |
+
+当前采用 Maven 多模块单体架构。模块边界清晰，后续可以按实际规模拆分为独立服务，但现阶段保留在一个应用中更容易学习、调试和部署。
+
+---
+
+## 四、当前已实现能力
+
+### 信息采集
+
+| 工具 | 作用 |
+|---|---|
+| `getSystemInfo` | 获取操作系统、CPU、内存、显卡、主板、磁盘、负载和温度等信息 |
+| `getDiskSpace` | 查询磁盘分区容量、剩余空间和使用率 |
+| `scanVcRedist` | 检测 VC++ 运行库和关键 DLL 缺失情况 |
+
+### 压力测试与长任务
+
+| 工具 | 作用 |
+|---|---|
+| `startCpuStress` / `getCpuStressStatus` / `stopCpuStress` | CPU 压测、状态查询和停止 |
+| `startMemStress` / `getMemStressStatus` / `stopMemStress` | 使用 `Testlimit64.exe` 进行内存压力测试、状态查询和停止 |
+| `startFurMark` | 使用 FurMark 进行显卡压力测试，并支持自动结束 |
+
+内存压力测试会明显占用系统资源，必须先向用户说明风险并取得明确确认。所有后台压测都应保留任务 ID，停止时调用对应的停止工具，不能只向用户回复“已停止”。
+
+### 硬件检测与维修
+
+- CPU-Z：CPU、主板和缓存信息
+- GPU-Z：显卡、显存、驱动和温度信息
+- Core Temp：CPU 核心温度与负载
+- AIDA64：综合硬件和传感器检测
+- CrystalDiskMark：磁盘读写性能测试
+- `smartctl`：磁盘 S.M.A.R.T. 健康数据
+- VC++ 运行库离线检测与修复
+- `runShellCommand`：受安全策略控制的 Windows 命令执行
+
+---
+
+## 五、安全设计
+
+系统将“模型建议”和“实际执行”分离，后端不会因为模型生成了某个工具调用就无条件执行。
+
+### 需要确认的场景
+
+- 删除文件、清理目录、卸载软件
+- 修改系统配置或注册表
+- 修复、安装或卸载运行库
+- 内存、CPU、显卡等高负载压力测试
+- 可能影响用户数据或系统稳定性的命令
+
+### 安全原则
+
+1. 先解释操作目的和可能风险。
+2. 危险命令展示原文，不隐藏真实执行内容。
+3. 用户明确确认后，后端才允许执行。
+4. 明确禁止的命令即使确认也不执行。
+5. 长任务必须支持查询状态和主动停止。
+
+---
+
+## 六、技术栈
+
+| 技术 | 用途 |
+|---|---|
+| Java 17+ | 后端开发语言 |
+| Spring Boot 3.3.5 | 应用框架 |
+| Spring AI 1.0.0 | 模型调用与 Function Calling |
+| DeepSeek + Qwen | 主模型与备用模型 |
+| OSHI | 操作系统和硬件信息采集 |
+| MySQL 8 | 用户、会话和业务数据持久化 |
+| Redis | 任务状态和热数据 |
+| RabbitMQ | 异步任务、延迟终止和消息调度 |
+| MyBatis-Plus | 数据访问 |
+| WebSocket | 长任务进度实时推送 |
+| Windows 本地工具 | FurMark、Testlimit、CPU-Z、GPU-Z 等真实检测工具 |
+
+---
+
+## 七、运行环境
+
+### 必需依赖
+
+1. JDK 17 或更高版本
+2. Maven 3.9+
+3. MySQL 8.0+
+4. Redis
+5. RabbitMQ
+6. Windows 系统及项目 `tool` 目录中的相关工具
+7. DeepSeek API Key
+8. 阿里百炼 API Key（LLM 备用模型和 RAG Embedding 使用）
+
+### 环境变量
+
+请通过 IDEA 的运行配置或系统环境变量配置，不要把真实密钥提交到 Git：
+
+```text
+MYSQL_PASSWORD=你的数据库密码
+DEEPSEEK_API_KEY=你的 DeepSeek Key
+DASHSCOPE_API_KEY=你的阿里百炼 Key
+```
+
+### 启动依赖服务
+
+```bash
+# RabbitMQ 示例
+Docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+```
+
+同时确保 MySQL、Redis 和 RabbitMQ 已启动，并完成数据库初始化。
+
+### 启动项目
+
+在 IDEA 中打开根目录，运行：
+
+```text
+com.corepulse.CorePulseApplication
+```
+
+或在项目根目录执行：
+
+```bash
 mvn -pl corepulse-web -am spring-boot:run
 ```
 
-启动后: http://localhost:8080
-接口文档: `../设计文档/api_openapi.json`(导入 Apifox)
+当前 Web 服务端口由 `corepulse-web/src/main/resources/application.yml` 配置，默认端口为 `927`。
 
-## 已注册工具能力
+---
 
-所有工具均通过 Function Calling 注册，LLM 会根据用户需求自动选择合适的工具调用。工具按真实可执行程序与 OSHI 采集实现，非模拟器。
+## 八、体验示例
 
-### 数据采集工具（真实数据）
-| 工具 | 说明 |
-|---|---|
-| `getSystemInfo` | 硬件配置与实时状态（OS/CPU/内存/显卡/主板/磁盘/负载/温度）— OSHI 真实采集 |
-| `getDiskSpace` | 各磁盘分区总容量/剩余空间/使用率 — OSHI 真实采集 |
-| `scanVcRedist` | 检测已安装的 VC++ 运行库及关键 DLL 缺失 |
+可以尝试向 AI 提问：
 
-### 压力测试工具（真实执行，长任务可查状态/手动停止）
-| 工具 | 说明 |
-|---|---|
-| `startFurMark` | 显卡烤机（真实 FurMark.exe），默认 30 分钟，到时自动关闭 |
-| `startCpuStress` / `getCpuStressStatus` / `stopCpuStress` | CPU 满载压测 + 状态查询 + 停止 |
-| `startMemStress` / `getMemStressStatus` / `stopMemStress` | 内存压力测试（高危，需确认）+ 状态 + 停止 |
-| `runMemTest` | 内存稳定性测试（MemTest64） |
-
-### 硬件检测工具（打开真实工具窗口）
-| 工具 | 说明 |
-|---|---|
-| `openCpuInfo` | CPU-Z：CPU 型号/主频/缓存/主板 |
-| `openGpuInfo` | GPU-Z：显卡型号/显存/驱动/温度 |
-| `openCpuTemp` | Core Temp：各核心实时温度与负载 |
-| `openAida64` | AIDA64：综合检测 + 传感器 + 稳定性测试 |
-| `benchDisk` | CrystalDiskMark：磁盘顺序/随机读写速度 |
-| `scanDiskDevices` / `checkDiskHealth` | 列出磁盘设备 + 读取完整 S.M.A.R.T. 健康数据（PASSED/FAILED/温度/通电时间/重分配扇区等） |
-
-### 修复工具（需用户确认）
-| 工具 | 说明 |
-|---|---|
-| `repairVcRedist` | 用本地离线安装包静默修复 VC++ 运行库（解决缺少 msvcp140.dll 等） |
-
-### 终端命令工具（通用）
-`runShellCommand` 让 LLM 可直接执行 cmd 命令，用于查询系统信息、检测进程、查看目录、清理磁盘等。
-
-**安全策略**：
-- 危险命令（删除/格式化/关机/改注册表等）需二次确认，命令原文展示给用户
-- 完全禁止命令（如格式化系统盘、静默删系统目录等）即使确认也不执行
-- LLM 须先解释命令执行后果，再等用户确认
-
-## 快速体验
-
-```
-POST /api/chat/send
-{"content": "帮我看看电脑配置"}
-
-POST /api/chat/send
-{"content": "帮我查一下C盘空间"}
-
-POST /api/chat/send
-{"content": "C盘快满了，帮我清理一下临时文件"}
-
-POST /api/chat/send
-{"content": "我的程序报错缺少msvcp140.dll，帮我修复"}
-
-POST /api/tools/furmark/start
-{"durationMin": 1, "sessionId": 1}
-
-GET /api/tools/furmark/status?taskId=1
+```text
+帮我看看电脑配置
+帮我查一下 C 盘空间
+我的电脑最近经常蓝屏，应该检查什么？
+帮我检测一下磁盘健康状态
+我的程序提示缺少 msvcp140.dll，帮我分析一下
+帮我进行一次内存压力测试
 ```
 
-烤机进度: `ws://localhost:8080/ws/chat?sessionId=1` 接收 `tool_progress` 事件。
+对于内存压测、文件清理和运行库修复等操作，AI 应先说明风险并等待确认。
 
-## 架构亮点
+---
 
-- **LLM + 工具臂**：DeepSeek 决策，真实本机工具执行，实现"能查、能测、能修"
-- **任务状态机 + MQ 死信延迟队列**：长任务（如烤机自动关闭、修复安装）可靠调度
-- **WebSocket 实时进度**：烤机等长任务进度实时推送前端
-- **RAG 个人知识库**：从本地向量库检索维修知识片段，注入对话上下文
-- **双重安全确认**：危险终端命令与修复操作均需用户明确确认
+## 九、当前状态与后续计划
+
+### 已完成
+
+- [x] Spring Boot 多模块后端骨架
+- [x] 主模型与备用模型降级策略
+- [x] Function Calling 工具注册与调用
+- [x] OSHI 真实硬件信息采集
+- [x] CPU、内存、显卡压力测试任务
+- [x] Testlimit 内存压力测试接入
+- [x] Redis 任务状态管理
+- [x] RabbitMQ 异步调度与延迟终止
+- [x] WebSocket 实时进度推送
+- [x] 磁盘 S.M.A.R.T. 检测
+- [x] VC++ 运行库检测与确认修复
+- [x] RAG 本地维修知识库
+- [x] 危险命令和高风险操作确认机制
+
+### 适合继续完善
+
+- [ ] 统一诊断报告模型，生成结构化维修报告
+- [ ] 保存完整的诊断记录、工具调用记录和执行结果
+- [ ] 增加主备模型、工具超时和高风险操作的自动化测试
+- [ ] 增加前端聊天界面、任务卡片和维修历史页面
+- [ ] 增加权限管理和管理员权限检测
+- [ ] 增加一键导出诊断报告功能
+- [ ] 完善部署文档和生产环境配置
+
+---
+
+## 十、项目定位
+
+CorePulse 当前更适合作为：
+
+- Java 学习者的综合实践项目；
+- Spring AI 智能体开发案例；
+- Windows 系统工具编排实验；
+- 电脑维修知识与自动化执行结合的后端原型。
+
+它的核心价值不在于“让 AI 代替维修人员”，而在于建立一套**有工具、有边界、有确认、有记录**的智能维修流程：让 AI 帮助用户理解电脑问题，同时把最终执行权交还给用户。
