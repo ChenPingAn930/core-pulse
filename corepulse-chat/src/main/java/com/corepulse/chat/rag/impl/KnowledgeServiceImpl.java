@@ -48,8 +48,9 @@ public class KnowledgeServiceImpl implements KnowledgeService {
 
     /** 匹配「### 数字.数字 标题」格式的 Markdown 小节标题，例如 `### 3.2 系统运行卡顿/缓慢` */
     private static final Pattern SECTION_HEADING = Pattern.compile("^###\\s+\\d+\\.\\d+\\s+.*$");
-    /** 匹配「## 第X章」Markdown 章节标题 */
-    private static final Pattern CHAPTER_HEADING = Pattern.compile("^##\\s+第.*$");
+    /** 匹配「## 第X章」或「## 中文数字、」格式的 Markdown 章节标题，
+     *  例如 `## 第一章 自启动的来源`、`## 六、自启动"挡不住"的常见坑` */
+    private static final Pattern CHAPTER_HEADING = Pattern.compile("^##\\s+(第[一二三四五六七八九十百\\d]+章|[一二三四五六七八九十百]+、).*$");
     /** 匹配纯文本章节标题（无 Markdown 符号），例如 `第四章 第三步：复制（robocopy 详解）` */
     private static final Pattern PLAIN_CHAPTER = Pattern.compile("^第[一二三四五六七八九十百\\d]+章\\s+.*$");
     /** 匹配纯文本小节标题（行首 数字.数字），例如 `4.2 robocopy 标准命令` */
@@ -83,29 +84,42 @@ public class KnowledgeServiceImpl implements KnowledgeService {
      */
     @PostConstruct
     public void initialize() {
+        // 向量数据文件：存所有文档切块后的向量（JSON 格式）
         File storeFile = Paths.get(storeFilePath).toFile();
-        // 指纹文件：记录上次向量化时的 MD 内容哈希
+        // 指纹文件：记录"本次向量化时"所有 MD 文档内容的 MD5 哈希
+        // 作用：本次启动时，用"当前指纹"对比"上次存的指纹"，
+        //       一致=文档没变(直接加载缓存)，不一致=文档变了(重新向量化)
         File versionFile = new File(storeFile.getParentFile(), "knowledge-version.txt");
+        // 当前指纹：现在所有知识文档内容的 MD5 哈希（内容改一个字符，哈希就完全不同）
         String currentFingerprint = currentMdFingerprint();
 
+        // 情况1：向量文件存在 且 当前指纹 == 上次记录的指纹
+        // 说明文档从上次到现在没变过 → 直接加载缓存，省时省钱（不重新调用 Embedding API）
         if (storeFile.exists() && storeFile.length() > 0
+                // 指纹不为空 且 当前指纹 == 上次记录的指纹
                 && currentFingerprint != null
                 && currentFingerprint.equals(readFingerprint(versionFile))) {
             try {
+                // 加载向量数据文件
                 vectorStore.load(storeFile);
                 log.info("RAG 知识库已从本地文件加载(文档未变更，无需重新向量化): {}", storeFile);
                 return;
             } catch (Exception e) {
+                // 缓存文件损坏/加载失败 → 删掉，走下面的重新向量化
                 log.warn("RAG 知识库文件加载失败，将重新向量化: {}", e.getMessage());
                 storeFile.delete();
             }
         } else if (storeFile.exists()) {
+            // 情况2：向量文件存在 但 指纹不一致 → 文档变了，删掉旧缓存重建
             log.info("RAG 知识库文档已变更或指纹缺失，重新向量化...");
             storeFile.delete();
         } else {
+            // 情况3：向量文件不存在 → 首次运行，直接走下面的向量化
             log.info("RAG 知识库无本地缓存，开始从 MD 文档向量化...");
         }
+        // 走到这里说明需要重新向量化：切块 + 调 Embedding API + 存向量
         buildFromKnowledge(storeFile);
+        // 向量化完成后，把当前指纹写进指纹文件，作为"下次对比"的依据
         writeFingerprint(versionFile, currentFingerprint);
     }
     // 检索
@@ -160,23 +174,31 @@ public class KnowledgeServiceImpl implements KnowledgeService {
     }
 
     /**
-     * 从所有知识库文档切块、向量化并持久化
+     * 从所有知识库文档切块、向量化并持久化。
+     * 这是 RAG 的"离线准备"阶段：把文档变成可检索的向量，存到本地文件。
+     * 只有文档变更（指纹不一致）或首次运行时才会走到这里。
      */
     private void buildFromKnowledge(File storeFile) {
         try {
+            // 1. 切块：遍历所有文档，把每篇文档切成若干小片段（chunk）
+            //    片段是检索的最小单位，后续按片段做相似度匹配
             List<Document> chunks = new ArrayList<>();
             for (Resource resource : resolveKnowledgeResources()) {
                 chunks.addAll(loadChunks(resource));
             }
+            // 2. 空保护：一个片段都没有就说明文档为空/解析失败，直接返回
             if (chunks.isEmpty()) {
                 log.warn("知识库文档为空或解析失败, location={}", knowledgeLocation);
                 return;
             }
+            // 3. 向量化：把每个片段用 Embedding 模型转成向量，加入向量库
+            //    向量是"文字的数字表示"，后续检索靠向量相似度
             vectorStore.add(chunks);
-            // 持久化到本地文件
+            // 4. 持久化：把向量数据存到本地 JSON 文件
+            //    这样下次启动能直接加载，不用重新向量化（省时间、省 API 费用）
             File dir = storeFile.getParentFile();
             if (dir != null && !dir.exists()) {
-                dir.mkdirs();
+                dir.mkdirs();  // 目录不存在则先创建
             }
             vectorStore.save(storeFile);
             log.info("知识库已加载 {} 个片段并持久化到 {}", chunks.size(), storeFile);
@@ -194,19 +216,26 @@ public class KnowledgeServiceImpl implements KnowledgeService {
      */
     private String currentMdFingerprint() {
         try {
+            // 拿到所有知识文档（classpath:knowledge/*.md）
             List<Resource> resources = resolveKnowledgeResources();
+            // 如果没有文档则返回 null
             if (resources.isEmpty()) {
                 return null;
             }
+            // MD5 是"内容哈希"：内容改一个字符，结果就完全不同
             MessageDigest md = MessageDigest.getInstance("MD5");
             for (Resource resource : resources) {
+                // 关键：把"文件名"也喂进哈希，这样新增/删除/重命名文件都会改变指纹
                 md.update(resource.getFilename().getBytes(StandardCharsets.UTF_8));
+                // 再把文件内容喂进去
                 md.update(resource.getInputStream().readAllBytes());
             }
+            // 把 MD5 的字节数组转成十六进制字符串（如 "a3f2..."）
             StringBuilder sb = new StringBuilder();
             for (byte b : md.digest()) {
                 sb.append(String.format("%02x", b));
             }
+            // 只取前 16 位，够用且更短（16 位十六进制 = 64 bit，碰撞概率极低）
             return sb.length() > 16 ? sb.substring(0, 16) : sb.toString();
         } catch (Exception e) {
             log.warn("计算知识库文档指纹失败: {}", e.getMessage());
@@ -215,11 +244,14 @@ public class KnowledgeServiceImpl implements KnowledgeService {
     }
 
     /**
-     * 读取已记录的指纹文件内容（trim 后）
+     * 读取指纹文件里记录的"上次向量化时的指纹"。
+     * 作用：在 initialize() 里和当前指纹对比，判断文档是否变过。
+     * 返回 null 表示：文件不存在 或 读取失败（此时 initialize() 会走"重新向量化"分支）。
      */
     private String readFingerprint(File versionFile) {
         try {
             if (versionFile.exists()) {
+                // trim() 去掉首尾空白，防止写入时残留的换行符导致对比失败
                 return Files.readString(versionFile.toPath()).trim();
             }
         } catch (IOException e) {
@@ -259,44 +291,49 @@ public class KnowledgeServiceImpl implements KnowledgeService {
      * @return 切块后的 Document 列表
      */
     private List<Document> loadChunks(Resource resource) throws IOException {
+        // 源文件名（去掉 .md 后缀），作为 metadata 里的 source 字段
         String sourceName = resource.getFilename() != null
                 ? resource.getFilename().replaceFirst("\\.md$", "")
                 : "知识库";
+        // 把整个文档读成字符串（UTF-8 编码）
         String content = new String(resource.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
 
         // 1. 去掉 YAML front-matter（--- ... ---）
         content = stripFrontMatter(content);
 
-        // 2. 按标题切块
+        // 2. 按标题切块：核心思路是"逐行扫描，遇到标题就开新块"
+        //    sections 存切好的块：key=块标题，value=块内容
         Map<String, StringBuilder> sections = new LinkedHashMap<>();
-        String currentChapter = null;   // 当前章名，作为块的上下文前缀
-        String currentKey = null;       // 当前块标题
-        StringBuilder current = new StringBuilder();
-        boolean tocMode = false;        // 处于文档开头「目录」区
-        boolean plainFormat = false;    // 纯文本格式文档（出现无 Markdown 符号的章标题后置 true）
-        java.util.Set<String> tocChapters = new java.util.HashSet<>();
+        String currentChapter = null;   // 当前章名，作为块的上下文前缀（让块知道自己在哪一章）
+        String currentKey = null;       // 当前块的标题
+        StringBuilder current = new StringBuilder();  // 正在累积的当前块内容
+        boolean tocMode = false;        // 是否处于文档开头「目录」区（目录行不切块）
+        boolean plainFormat = false;    // 是否纯文本格式文档（无 Markdown 符号的章标题出现后置 true）
+        java.util.Set<String> tocChapters = new java.util.HashSet<>();  // 记录目录里出现过的章标题
 
+        // 逐行扫描文档，核心逻辑：判断每行是"标题"还是"正文"，标题就开新块，正文就追加到当前块
         for (String line : content.split("\\r?\\n")) {
             String trimmed = line.trim();
 
-            // 「目录」区识别与跳过：目录行不产生块，避免切成一堆只有标题的垃圾块
+            // 「目录」区识别与跳过：文档开头的目录行不产生块，避免切成一堆只有标题的垃圾块
             if ("目录".equals(trimmed)) {
-                tocMode = true;
+                tocMode = true;   // 遇到"目录"二字，进入目录模式
                 continue;
             }
             if (tocMode) {
                 if (trimmed.isEmpty()) {
-                    continue;
+                    continue;   // 目录区里的空行，跳过
                 }
                 if (PLAIN_CHAPTER.matcher(trimmed).matches()) {
+                    // 目录区里出现章标题（如"第一章 xxx"）
                     if (tocChapters.contains(trimmed)) {
-                        tocMode = false; // 章标题二次出现 = 正文开始，按正常章节处理
+                        tocMode = false; // 章标题第二次出现 = 已到正文，退出目录模式
                     } else {
-                        tocChapters.add(trimmed);
-                        continue; // 目录条目，跳过
+                        tocChapters.add(trimmed);  // 第一次出现 = 目录条目，记录并跳过
+                        continue;
                     }
                 } else if (!SECTION_HEADING.matcher(trimmed).matches()) {
-                    tocMode = false; // 非章节非小节的实内容行，退出目录模式按正文处理
+                    tocMode = false; // 非章节非小节的实内容行，说明正文开始了，退出目录模式
                 }
             }
 
@@ -305,35 +342,38 @@ public class KnowledgeServiceImpl implements KnowledgeService {
             }
             if (CHAPTER_HEADING.matcher(trimmed).matches()
                     || PLAIN_CHAPTER.matcher(trimmed).matches()) {
+                // ===== 遇到"章节标题"（## 第X章 / ## 中文数字、 / 纯文本第X章）=====
                 if (PLAIN_CHAPTER.matcher(trimmed).matches()) {
-                    plainFormat = true;
+                    plainFormat = true;  // 纯文本格式，后续小节也要用纯文本规则识别
                 }
-                // 章节标题：冲刷当前块，开启以章名为键的新块（承接章内引言内容）
+                // 先把当前累积的块存进 sections（冲刷），再开新块
                 if (currentKey != null && current.length() > 0) {
                     sections.put(currentKey, current);
                 }
+                // 章名去掉 "## " 前缀，作为新块的标题，也作为章内小节的上下文前缀
                 currentChapter = trimmed.replaceFirst("^##\\s+", "");
                 currentKey = currentChapter;
                 current = new StringBuilder();
-                current.append(currentChapter).append("\n");
+                current.append(currentChapter).append("\n");  // 块首放章名，让 LLM 知道上下文
                 continue;
             }
             if (SECTION_HEADING.matcher(trimmed).matches()
                     || (plainFormat && PLAIN_SECTION.matcher(trimmed).matches())) {
-                // 小节标题：开启新块
+                // ===== 遇到"小节标题"（### X.Y / 纯文本 X.Y）=====
                 if (currentKey != null && current.length() > 0) {
-                    sections.put(currentKey, current);
+                    sections.put(currentKey, current);  // 冲刷当前块
                 }
-                currentKey = trimmed.replaceFirst("^###\\s+", "");
+                currentKey = trimmed.replaceFirst("^###\\s+", "");  // 小节标题去掉 "### " 前缀
                 current = new StringBuilder();
                 if (currentChapter != null) {
-                    current.append(currentChapter).append("\n");
+                    current.append(currentChapter).append("\n");  // 块首放章名作上下文
                 }
-                current.append(currentKey).append("\n");
+                current.append(currentKey).append("\n");  // 再放小节标题
                 continue;
             }
+            // ===== 普通内容行 =====
             if (currentKey != null) {
-                current.append(line).append("\n");
+                current.append(line).append("\n");  // 追加到当前块
             }
         }
         if (currentKey != null && current.length() > 0) {
@@ -345,12 +385,14 @@ public class KnowledgeServiceImpl implements KnowledgeService {
         //    硬件操作步骤前，必然先看到并转述这些安全警告，避免步骤讲完却遗漏块尾的风险提示。
         List<Document> docs = new ArrayList<>();
         for (Map.Entry<String, StringBuilder> entry : sections.entrySet()) {
-            String heading = entry.getKey().replace("### ", "").trim();
-            String raw = entry.getValue().toString().trim();
+            String heading = entry.getKey().replace("### ", "").trim();  // 块标题（去掉 ### 前缀）
+            String raw = entry.getValue().toString().trim();             // 块内容
             if (!StringUtils.hasText(raw)) {
-                continue;
+                continue;  // 空块跳过（只有标题没有内容的块）
             }
+            // 把风险警告前置到块首，再包装成 Document
             String text = prependRiskWarnings(raw);
+            // Document = 文本 + metadata（来源文件名 + 章节标题），供检索时定位
             docs.add(new Document(text, Map.of("source", sourceName, "section", heading)));
         }
         log.info("知识库文档切块完成: {}, 共 {} 个片段", sourceName, docs.size());

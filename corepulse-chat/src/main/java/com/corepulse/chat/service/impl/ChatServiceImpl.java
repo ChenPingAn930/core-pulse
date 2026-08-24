@@ -43,7 +43,9 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class ChatServiceImpl implements ChatService {
 
-    private static final int MAX_HISTORY = 20;
+    private static final int MAX_HISTORY = 40;
+    /** 历史中最多保留的工具执行记录条数：工具结果往往只对当轮有用，保留太多会撑爆上下文 */
+    private static final int MAX_TOOL_RECORDS = 8;
 
     /** 工具结果入库时的最大长度（避免大输出撑爆历史上下文，完整结果当轮已使用过） */
     private static final int MAX_TOOL_RESULT_LENGTH = 1200;
@@ -101,31 +103,52 @@ public class ChatServiceImpl implements ChatService {
         RecordingToolCallingManager.setCurrentSession(session.getId());
         boolean success = false;
         try {
-            // 2次重试
+            // 主模型重试：最多尝试 3 次，失败后指数退避等待，给 LLM 服务喘息时间
+            // 退避策略：第 1 次失败等 3 秒，第 2 次失败等 6 秒（每次翻倍）
+            // 为什么用指数退避而不是固定等待？
+            //   1. 服务刚超时/报错时往往处于"过载"状态，立即重试大概率还是失败，反而加重负担
+            //   2. 指数退避让等待时间随失败次数递增，给服务更多恢复时间，成功率更高
+            // 注意：这里用 Thread.sleep 会阻塞当前 Tomcat 工作线程，仅适合低并发场景；
+            //       若并发高，应改用 Spring Retry 的 ExponentialBackOffPolicy（不阻塞线程）
+            long waitMillis = 3000; // 首次等待 3 秒
             for (int i = 0; i < 3; i++) {
                 try {
-                // 调用 LLM
+                    // 调用 LLM
                     ChatResponse chatResponse = callModel(primaryChatClient, messages, session.getId(), invokedTools);
-                // 记录本次回复所基于的工具调用（工具调用信息在 AssistantMessage 的 toolCalls 中）
-                chatResponse.getResults().forEach(result -> {
-                    AssistantMessage output = result.getOutput();
-                    // 判断输出是否为空，避免空指针异常 以及 判断 toolCalls 是否为空，避免空指针异常
-                    // 注意output.getToolCalls()不是指代的工具调用，而是指代的这里的对象是否被创建
-                    if (output != null && output.getToolCalls() != null) {
-                        // 获取工具调用名称
-                        output.getToolCalls().forEach(tc -> invokedTools.add(tc.name()));
+                    // 记录本次回复所基于的工具调用（工具调用信息在 AssistantMessage 的 toolCalls 中）
+                    chatResponse.getResults().forEach(result -> {
+                        AssistantMessage output = result.getOutput();
+                        // 判断输出是否为空，避免空指针异常 以及 判断 toolCalls 是否为空，避免空指针异常
+                        // 注意output.getToolCalls()不是指代的工具调用，而是指代的这里的对象是否被创建
+                        if (output != null && output.getToolCalls() != null) {
+                            // 获取工具调用名称
+                            output.getToolCalls().forEach(tc -> invokedTools.add(tc.name()));
+                        }
+                    });
+                    // 获取最终回复
+                    reply = chatResponse.getResult() != null ? chatResponse.getResult().getOutput().getText() : null;
+                    if (reply != null && !reply.isBlank()) {
+                        log.info("会话 {} 获取到回复: {}", session.getId(), reply);
+                        success = true;
+                        break;
                     }
-                });
-                // 获取最终回复
-                reply = chatResponse.getResult() != null ? chatResponse.getResult().getOutput().getText() : null;
-                if (reply != null && !reply.isBlank()) {
-                    log.info("会话 {} 获取到回复: {}", session.getId(), reply);
-                    success = true;
-                    break;
                 }
-            }
                 catch (Exception e) {
                     log.warn("第 {} 次调用 LLM 失败,重试中...", i+1, e);
+                    // 最后一次失败后不再等待（没有下一次重试了），直接跳出循环走降级逻辑
+                    if (i == 2) {
+                        break;
+                    }
+                    // 指数退避：本次失败后等待 waitMillis 毫秒再重试，然后等待时间翻倍
+                    log.info("会话 {} 等待 {} 毫秒后重试...", session.getId(), waitMillis);
+                    try {
+                        Thread.sleep(waitMillis);
+                    } catch (InterruptedException ie) {
+                        // 线程被中断（如服务关闭），恢复中断标志并放弃等待，直接重试
+                        Thread.currentThread().interrupt();
+                        log.warn("会话 {} 重试等待被中断", session.getId());
+                    }
+                    waitMillis *= 2; // 每次翻倍：3秒 -> 6秒
                 }
             }
             if (!success) {
@@ -185,8 +208,8 @@ public class ChatServiceImpl implements ChatService {
 
         log.info("会话 {} 摘要游标={}, 未摘要消息数={}",
                 session.getId(), lastSummarizedMessageId, unsummarizedMessages.size());
-        if (unsummarizedMessages.size() < 20) {
-            log.info("会话 {} 未摘要消息不足20条，不生成摘要", session.getId());
+        if (unsummarizedMessages.size() < 40) {
+            log.info("会话 {} 未摘要消息不足40条，不生成摘要", session.getId());
             return ChatSendVO.builder()
                     .sessionId(session.getId())
                     .reply(reply)
@@ -306,6 +329,12 @@ public class ChatServiceImpl implements ChatService {
                         .last("LIMIT " + MAX_HISTORY));
         // 倒序，保证按时间正序
         Collections.reverse(history);
+        // 工具记录瘦身：先统计历史里共有多少条工具记录，只保留最后 MAX_TOOL_RECORDS 条
+        // （工具结果往往只对当轮有用，旧工具结果对当前回答帮助不大，保留太多会撑爆上下文）
+        long totalToolRecords = history.stream()
+                .filter(m -> MessageRole.TOOL.getValue().equals(m.getRole()))
+                .count();
+        long skippedToolRecords = 0;
         // 组装历史消息
         for (ChatMessage m : history) {
             // 拿到消息角色 user / assistant / system / tool */
@@ -315,6 +344,11 @@ public class ChatServiceImpl implements ChatService {
             } else if (MessageRole.ASSISTANT.getValue().equals(role)) {
                 messages.add(new AssistantMessage(m.getContent()));
             } else if (MessageRole.TOOL.getValue().equals(role)) {
+                // 只保留最近 MAX_TOOL_RECORDS 条工具记录，更早的跳过
+                if (skippedToolRecords < totalToolRecords - MAX_TOOL_RECORDS) {
+                    skippedToolRecords++;
+                    continue;
+                }
                 // 工具结果还原为上下文：因未保存原始 toolCallId，无法还原为 API 层 tool 消息，
                 // 以带前缀的普通消息形式注入，既避免消息配对校验报错，又能让 LLM 看到工具事实
                 messages.add(new UserMessage("[工具执行记录] 工具 " + m.getToolName()

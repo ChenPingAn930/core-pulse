@@ -196,7 +196,16 @@ public class ShellCommandTool implements SystemTool {
             return false;
         }
         String firstWord = lower.split("[\\s]+", 2)[0];
-        if (!READONLY_FIRST_WORDS.contains(firstWord)) {
+        // 精细识别 sc / reg 的"查询子命令"：sc query、reg query 是只读查询，直接执行；
+        // 但 sc delete、reg add 等写操作不视为只读（会被 isDangerous 拦截或走确认流程）
+        if ("sc".equals(firstWord) || "reg".equals(firstWord)) {
+            String secondWord = lower.split("[\\s]+", 3).length > 1
+                    ? lower.split("[\\s]+", 3)[1]
+                    : "";
+            if (!"query".equals(secondWord)) {
+                return false;  // sc/reg 非 query 子命令，不视为只读
+            }
+        } else if (!READONLY_FIRST_WORDS.contains(firstWord)) {
             return false;
         }
         // 管道：仅 powershell 内查询 cmdlet 间管道放行（各段已由危险词/写 cmdlet 检查覆盖），

@@ -152,6 +152,9 @@ public class RecordingToolCallingManager implements ToolCallingManager {
         }
         try {
             chatEventPublisher.publishToolResult(sessionId, response.name(), truncate(response.responseData()));
+            log.info("推送 tool_result 事件: tool={}, 结果长度={}",
+                    response.name(),
+                    response.responseData() != null ? response.responseData().length() : 0);
         } catch (Exception e) {
             log.warn("推送 tool_result 事件失败: {}", e.getMessage());
         }

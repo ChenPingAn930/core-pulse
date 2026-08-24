@@ -30,9 +30,9 @@ spring:
 corepulse:
   llm:
     primary:
-      base-url: https://api.deepseek.com
-      api-key: ${DEEPSEEK_API_KEY}
-      model: deepseek-chat
+      base-url: https://chatapi.weixin.qq.com/openai/v1
+      api-key: ${WECHAT_API_KEY}
+      model: Deepseek-v4-flash
       temperature: 0.7
     backup:
       base-url: https://dashscope.aliyuncs.com/compatible-mode
