@@ -107,7 +107,8 @@ public class ChatClientConfig {
                 .baseUrl(backupBaseUrl)
                 .apiKey(backupApiKey)
                 .build();
-
+        System.out.println(">>> backupApiKey = " + backupApiKey);
+        System.out.println(">>> backupBaseUrl = " + backupBaseUrl);
         OpenAiChatOptions options = new OpenAiChatOptions();
         options.setModel(backupModel);
         options.setTemperature(backupTemperature);

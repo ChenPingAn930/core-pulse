@@ -2,6 +2,7 @@ package com.corepulse.chat.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+import com.corepulse.chat.Enum.FeatureGuideEnum;
 import com.corepulse.chat.Enum.PromptEnum;
 import com.corepulse.chat.Enum.ReinstallGuideEnum;
 import com.corepulse.chat.config.RecordingToolCallingManager;
@@ -16,6 +17,7 @@ import com.corepulse.chat.service.SessionService;
 import com.corepulse.domain.entity.ChatMessage;
 import com.corepulse.domain.entity.ChatSession;
 import com.corepulse.domain.enums.MessageRole;
+import com.corepulse.system.tool.UninstallVerifyToolkit;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -62,6 +64,7 @@ public class ChatServiceImpl implements ChatService {
     private final ChatSessionMapper sessionMapper;
     private final KnowledgeService knowledgeService;
     private final ChatEventPublisher chatEventPublisher;
+    private final UninstallVerifyToolkit uninstallVerifyToolkit;
 
     /**
      * 发送消息 - AI 对话核心流程
@@ -190,6 +193,19 @@ public class ChatServiceImpl implements ChatService {
             reply = "我已经处理了你的请求，但没能生成合适的回复，请再试一次。";
         }
 
+        // 6.5 卸载残留校验仲裁：模型声称"卸载干净"但本轮没调用 verifyUninstallApp → 强制补验
+        // 原理：残留目录名往往和软件名无关，模型按软件名 dir 搜不到就"背稿"说干净。
+        // 后端只认"verifyUninstallApp 真被调用过 + 其返回 JSON 的 clean"，防止假验收。
+        boolean isUninstallIntent = hasUninstallIntent(request.getContent());
+        boolean claimsClean = isUninstallIntent && CLAIM_CLEAN_WORDS.stream().anyMatch(reply::contains);
+        boolean verified = invokedTools.stream().anyMatch(t -> t.startsWith("verifyUninstallApp"));
+        if (isUninstallIntent && claimsClean && !verified) {
+            log.warn("[卸载校验拦截] 会话 {} 声称卸载干净但未调用 verifyUninstallApp，已代跑", session.getId());
+            String verifyJson = tryRunVerify(request.getContent(), session.getId());
+            reply = "本轮缺少卸载后校验，已由系统代为执行 verifyUninstallApp，结果如下：\n" + verifyJson
+                    + "\n（请确认并告知用户：clean 为 false 时残留清单见上，是否清理请征得用户同意。）";
+        }
+
         // 7. 保存 AI 回复
         saveMessage(session.getId(), MessageRole.ASSISTANT.getValue(), reply, null, null);
         log.info("会话 {} 回复完成, replyLen={}", session.getId(), reply.length());
@@ -284,6 +300,31 @@ public class ChatServiceImpl implements ChatService {
             "制作U盘", "启动盘", "安装u盘", "重做系统", "重灌系统"
     );
 
+    /** 卸载意图关键词（命中则触发卸载残留校验仲裁） */
+    private static final List<String> UNINSTALL_KEYWORDS = List.of(
+            "卸载", "删除软件", "删掉", "remove", "uninstall", "卸掉"
+    );
+
+    /** 声称"卸载干净"的措辞（命中且未调用 verify 工具则拦截补验） */
+    private static final List<String> CLAIM_CLEAN_WORDS = List.of(
+            "卸载", "删除", "已卸载", "干净", "无残留"
+    );
+
+    /** 磁盘清理意图关键词（命中则注入磁盘清理专项引导） */
+    private static final List<String> DISK_CLEAN_KEYWORDS = List.of(
+            "清理", "磁盘满", "磁盘空间", "c盘", "C盘", "空间不足", "清理垃圾", "清垃圾"
+    );
+
+    /** 运行库修复意图关键词（命中则注入运行库专项引导） */
+    private static final List<String> VCREDIST_KEYWORDS = List.of(
+            "运行库", "vc_redist", "vcredist", "msvcp", "vcruntime", "缺少dll", "缺少DLL", "dll缺失"
+    );
+
+    /** 压力测试意图关键词（命中则注入压测专项引导） */
+    private static final List<String> STRESS_KEYWORDS = List.of(
+            "压力测试", "压测", "烤机", "烤鸡", "满载测试", "稳定性测试", "cpu测试", "内存测试"
+    );
+
     /**
      * 构建发送给 LLM 的消息列表
      * <p>
@@ -319,6 +360,26 @@ public class ChatServiceImpl implements ChatService {
         // 重装系统意图检测：命中则注入图文引导
         if (hasReinstallIntent(userContent)) {
             messages.add(new SystemMessage(buildReinstallGuide()));
+        }
+
+        // 卸载意图检测：命中则注入卸载残留校验引导（按需注入，避免常驻 SYSTEM_DEFAULT 撑爆上下文）
+        if (hasUninstallIntent(userContent)) {
+            messages.add(new SystemMessage(FeatureGuideEnum.UNINSTALL.getContent()));
+        }
+
+        // 磁盘清理意图检测：命中则注入磁盘清理专项引导
+        if (hasDiskCleanIntent(userContent)) {
+            messages.add(new SystemMessage(FeatureGuideEnum.DISK_CLEAN.getContent()));
+        }
+
+        // 运行库修复意图检测：命中则注入运行库专项引导
+        if (hasVcRedistIntent(userContent)) {
+            messages.add(new SystemMessage(FeatureGuideEnum.VCREDIST.getContent()));
+        }
+
+        // 压力测试意图检测：命中则注入压测专项引导
+        if (hasStressIntent(userContent)) {
+            messages.add(new SystemMessage(FeatureGuideEnum.STRESS.getContent()));
         }
 
         /* 历史消息（最近 MAX_HISTORY 条，按 ID 正序）*/
@@ -448,6 +509,103 @@ public class ChatServiceImpl implements ChatService {
         }
         String lower = content.toLowerCase();
         return REINSTALL_KEYWORDS.stream().anyMatch(lower::contains);
+    }
+
+    /**
+     * 检测用户消息是否命中「卸载软件」意图
+     *
+     * @param content 用户消息内容
+     * @return 是否命中
+     */
+    private boolean hasUninstallIntent(String content) {
+        if (content == null || content.isBlank()) {
+            return false;
+        }
+        String lower = content.toLowerCase();
+        return UNINSTALL_KEYWORDS.stream().anyMatch(lower::contains);
+    }
+
+    /**
+     * 检测用户消息是否命中「磁盘清理」意图
+     */
+    private boolean hasDiskCleanIntent(String content) {
+        if (content == null || content.isBlank()) {
+            return false;
+        }
+        String lower = content.toLowerCase();
+        return DISK_CLEAN_KEYWORDS.stream().anyMatch(lower::contains);
+    }
+
+    /**
+     * 检测用户消息是否命中「运行库修复」意图
+     */
+    private boolean hasVcRedistIntent(String content) {
+        if (content == null || content.isBlank()) {
+            return false;
+        }
+        String lower = content.toLowerCase();
+        return VCREDIST_KEYWORDS.stream().anyMatch(lower::contains);
+    }
+
+    /**
+     * 检测用户消息是否命中「压力测试」意图
+     */
+    private boolean hasStressIntent(String content) {
+        if (content == null || content.isBlank()) {
+            return false;
+        }
+        String lower = content.toLowerCase();
+        return STRESS_KEYWORDS.stream().anyMatch(lower::contains);
+    }
+
+    /**
+     * 后端仲裁：代跑 verifyUninstallApp 补验。
+     * <p>
+     * 从用户消息中提取软件名（appName）作为入参；提取不到时用整条消息兜底。
+     * 只读校验，不删除任何文件。
+     *
+     * @param userContent 用户消息内容
+     * @param sessionId   会话 ID
+     * @return verifyUninstallApp 返回的结构化 JSON 文本
+     */
+    private String tryRunVerify(String userContent, Long sessionId) {
+        String appName = extractAppName(userContent);
+        try {
+            return uninstallVerifyToolkit.verifyUninstallApp(appName, null);
+        } catch (Exception e) {
+            log.error("会话 {} 代跑 verifyUninstallApp 失败: app={}", sessionId, appName, e);
+            return "{\"app\":\"" + appName + "\",\"hasSnapshot\":false,\"clean\":false,\"note\":\"代跑校验失败: "
+                    + e.getMessage() + "\"}";
+        }
+    }
+
+    /**
+     * 从用户消息中提取软件名（appName）。
+     * <p>
+     * 规则：定位"卸载/删除/删掉/卸掉"等关键词，取其后紧跟的一段非空白文本作为软件名；
+     * 若关键词后无有效内容，则返回整条消息（trim 后）作为兜底。
+     *
+     * @param content 用户消息内容
+     * @return 提取到的软件名
+     */
+    private String extractAppName(String content) {
+        if (content == null || content.isBlank()) {
+            return "";
+        }
+        String trimmed = content.trim();
+        String[] markers = {"卸载", "删除软件", "删掉", "卸掉", "删除", "remove", "uninstall"};
+        for (String marker : markers) {
+            int idx = trimmed.toLowerCase().indexOf(marker.toLowerCase());
+            if (idx >= 0) {
+                String after = trimmed.substring(idx + marker.length()).trim();
+                // 去掉结尾的标点/语气词，取第一段
+                after = after.replaceAll("[。！？!?，,、\\s]+$", "");
+                if (!after.isBlank()) {
+                    return after;
+                }
+            }
+        }
+        return trimmed;
     }
 
     /**
