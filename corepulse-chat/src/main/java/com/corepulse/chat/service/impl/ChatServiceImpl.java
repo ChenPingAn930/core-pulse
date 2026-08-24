@@ -25,6 +25,7 @@ import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.retry.support.RetryTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -103,16 +104,26 @@ public class ChatServiceImpl implements ChatService {
         RecordingToolCallingManager.setCurrentSession(session.getId());
         boolean success = false;
         try {
-            // 主模型重试：最多尝试 3 次，失败后指数退避等待，给 LLM 服务喘息时间
-            // 退避策略：第 1 次失败等 3 秒，第 2 次失败等 6 秒（每次翻倍）
+            // 主模型重试：用 Spring Retry 的 RetryTemplate 替代手写 for 循环 + Thread.sleep
+            // 为什么用 RetryTemplate 而不是手写循环？
+            //   1. 退避策略（指数退避）由框架管理，代码更简洁、更规范
+            //   2. RetryTemplate 内部用 Thread.sleep 实现等待，但封装了中断处理等细节
+            //   3. 语义清晰：RetryCallback 里"抛异常"就重试，"正常返回"就结束
+            // 退避策略：第 1 次失败等 3 秒，第 2 次失败等 6 秒（每次翻倍），最多重试 3 次
             // 为什么用指数退避而不是固定等待？
             //   1. 服务刚超时/报错时往往处于"过载"状态，立即重试大概率还是失败，反而加重负担
             //   2. 指数退避让等待时间随失败次数递增，给服务更多恢复时间，成功率更高
-            // 注意：这里用 Thread.sleep 会阻塞当前 Tomcat 工作线程，仅适合低并发场景；
-            //       若并发高，应改用 Spring Retry 的 ExponentialBackOffPolicy（不阻塞线程）
-            long waitMillis = 3000; // 首次等待 3 秒
-            for (int i = 0; i < 3; i++) {
-                try {
+            RetryTemplate retryTemplate = RetryTemplate.builder()
+                    .maxAttempts(3)                    // 最多尝试 3 次（含首次）
+                    .exponentialBackoff(3000, 2, 6000) // 首次等 3 秒，每次翻倍，上限 6 秒
+                    .build();
+            try {
+                // RetryCallback.doWithRetry 里写"一次尝试"的逻辑：
+                //   - 正常返回（拿到有效回复）→ 重试结束
+                //   - 抛异常 → 触发重试（按退避策略等待后重试）
+                reply = retryTemplate.execute(context -> {
+                    // context.getRetryCount() 返回当前是第几次重试（0 开始），用于日志
+                    log.info("会话 {} 调用模型, 第 {} 次尝试", session.getId(), context.getRetryCount() + 1);
                     // 调用 LLM
                     ChatResponse chatResponse = callModel(primaryChatClient, messages, session.getId(), invokedTools);
                     // 记录本次回复所基于的工具调用（工具调用信息在 AssistantMessage 的 toolCalls 中）
@@ -126,30 +137,19 @@ public class ChatServiceImpl implements ChatService {
                         }
                     });
                     // 获取最终回复
-                    reply = chatResponse.getResult() != null ? chatResponse.getResult().getOutput().getText() : null;
-                    if (reply != null && !reply.isBlank()) {
-                        log.info("会话 {} 获取到回复: {}", session.getId(), reply);
-                        success = true;
-                        break;
+                    String text = chatResponse.getResult() != null ? chatResponse.getResult().getOutput().getText() : null;
+                    // 关键：如果 LLM 没返回有效文本，抛异常触发重试；
+                    // 否则 RetryTemplate 认为"成功"，直接返回，不会重试
+                    if (text == null || text.isBlank()) {
+                        throw new IllegalStateException("LLM 返回空回复");
                     }
-                }
-                catch (Exception e) {
-                    log.warn("第 {} 次调用 LLM 失败,重试中...", i+1, e);
-                    // 最后一次失败后不再等待（没有下一次重试了），直接跳出循环走降级逻辑
-                    if (i == 2) {
-                        break;
-                    }
-                    // 指数退避：本次失败后等待 waitMillis 毫秒再重试，然后等待时间翻倍
-                    log.info("会话 {} 等待 {} 毫秒后重试...", session.getId(), waitMillis);
-                    try {
-                        Thread.sleep(waitMillis);
-                    } catch (InterruptedException ie) {
-                        // 线程被中断（如服务关闭），恢复中断标志并放弃等待，直接重试
-                        Thread.currentThread().interrupt();
-                        log.warn("会话 {} 重试等待被中断", session.getId());
-                    }
-                    waitMillis *= 2; // 每次翻倍：3秒 -> 6秒
-                }
+                    return text;
+                });
+                log.info("会话 {} 获取到回复: {}", session.getId(), reply);
+                success = true;
+            } catch (Exception e) {
+                // 3 次都失败（或返回空回复）会走到这里，记录日志后走降级逻辑
+                log.warn("主模型调用 3 次均失败, 准备降级到备用模型: {}", e.getMessage());
             }
             if (!success) {
                 try {
