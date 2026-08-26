@@ -57,6 +57,42 @@ corepulse:
     vector-store:
       # 向量数据持久化文件
       file: ${user.home}/.corepulse/vector-store.json
+  # ==================== 磁盘清理项配置（配置驱动，替代 DiskCleanTool 硬编码） ====================
+  # 新增清理项只需在此追加一条，无需改 Java 代码、无需重新编译。
+  # 安全边界：command 由本配置定义，LLM 只能传 key，无法注入任意路径。
+  clean-items:
+    items:
+      - key: userTemp
+        name: 用户临时文件（%TEMP%）
+        impact: 删除当前用户临时文件夹中的文件，正在被占用的文件会自动跳过，不影响任何软件正常使用
+        command: cmd /c del /f /s /q "%TEMP%\*" 2>nul & for /d %i in ("%TEMP%\*") do @rd /s /q "%i" 2>nul
+        auto-execute: true
+      - key: sysTemp
+        name: 系统临时文件（C:\Windows\Temp）
+        impact: 删除系统临时文件夹中的文件，正在被占用的文件会自动跳过，需要一定系统权限，部分文件可能删不掉属正常现象
+        command: cmd /c del /f /s /q "C:\Windows\Temp\*" 2>nul & for /d %i in ("C:\Windows\Temp\*") do @rd /s /q "%i" 2>nul
+        auto-execute: true
+      - key: wuCache
+        name: Windows 更新缓存（SoftwareDistribution\Download）
+        impact: 停止 Windows Update 服务后删除已下载的更新安装包缓存，再重新启动服务。已安装成功的更新不受影响
+        command: cmd /c net stop wuauserv 2>nul & del /f /s /q "C:\Windows\SoftwareDistribution\Download\*" 2>nul & net start wuauserv 2>nul
+        auto-execute: true
+      - key: recycleBin
+        name: 回收站
+        impact: 清空回收站，注意：回收站里的文件清空后将无法恢复，执行前请确认回收站内没有误删的重要文件
+        command: cmd /c powershell -NoProfile -Command "Clear-RecycleBin -Force -ErrorAction SilentlyContinue"
+        auto-execute: true
+      - key: crashDump
+        name: 崩溃转储文件（MEMORY.DMP / Minidump）
+        impact: 删除系统蓝屏/崩溃产生的内存转储文件。如果近期有蓝屏且还需要分析原因，建议先不要清理
+        command: cmd /c del /f /q "C:\Windows\MEMORY.DMP" 2>nul & del /f /s /q "C:\Windows\Minidump\*" 2>nul & del /f /s /q "C:\Windows\LiveKernelReports\*" 2>nul
+        auto-execute: true
+      - key: hibernate
+        name: 休眠文件（hiberfil.sys）
+        impact: 关闭休眠功能可释放与内存大小相当的C盘空间，但关闭后将无法使用休眠（快速启动也可能受影响）
+        command:
+        auto-execute: false
+        advice: 休眠文件需要管理员权限关闭，本工具不自动执行。如用户确认不再使用休眠，请指导用户以管理员身份运行命令提示符执行 powercfg /h off，或由用户在同意后通过终端命令工具执行（需确认）。
 
 mybatis-plus:
   configuration:

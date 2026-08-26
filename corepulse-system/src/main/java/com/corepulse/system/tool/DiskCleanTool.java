@@ -1,5 +1,6 @@
 package com.corepulse.system.tool;
 
+import com.corepulse.system.config.CleanItemProperties;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.model.ToolContext;
 import org.springframework.ai.tool.annotation.Tool;
@@ -46,14 +47,16 @@ public class DiskCleanTool implements SystemTool {
             "system volume information", "$recycle.bin", "$windows.~bt", "$windows.~ws"
     );
 
-    /**
-     * 清理项注册表：key -> 说明与执行命令。
-     * <p>
-     * 惯犯目录参考（供扫描分析时重点关注）：
-     * %TEMP%、C:\Windows\Temp、C:\Windows\SoftwareDistribution\Download、
-     * Downloads、AppData\Local\Temp、AppData\Local 下各软件缓存、C:\Windows\MEMORY.DMP
-     */
-    private static final Map<String, CleanItem> CLEAN_ITEMS = buildCleanItems();
+    /** 清理项配置（从 clean-items.yml 注入，替代硬编码） */
+    private final CleanItemProperties cleanItemProperties;
+
+    /** 清理项注册表：key -> 说明与执行命令（由配置构建） */
+    private final Map<String, CleanItem> cleanItems;
+
+    public DiskCleanTool(CleanItemProperties cleanItemProperties) {
+        this.cleanItemProperties = cleanItemProperties;
+        this.cleanItems = buildCleanItems();
+    }
 
     @Override
     public String toolName() {
@@ -130,13 +133,13 @@ public class DiskCleanTool implements SystemTool {
 
         // 1. 校验清理项
         if (items == null || items.isEmpty()) {
-            return "请指定要清理的项目，可选 key: " + String.join(", ", CLEAN_ITEMS.keySet());
+            return "请指定要清理的项目，可选 key: " + String.join(", ", cleanItems.keySet());
         }
         List<CleanItem> targets = new ArrayList<>();
         for (String key : items) {
-            CleanItem item = CLEAN_ITEMS.get(key);
+            CleanItem item = cleanItems.get(key);
             if (item == null) {
-                return "未知的清理项: " + key + "。可选 key: " + String.join(", ", CLEAN_ITEMS.keySet());
+                return "未知的清理项: " + key + "。可选 key: " + String.join(", ", cleanItems.keySet());
             }
             targets.add(item);
         }
@@ -299,35 +302,18 @@ public class DiskCleanTool implements SystemTool {
         return String.format("%.2f GB", bytes / (1024.0 * 1024 * 1024));
     }
 
-    /** 构建清理项注册表（路径全部硬编码，杜绝路径注入） */
-    private static Map<String, CleanItem> buildCleanItems() {
+    /** 构建清理项注册表（从 clean-items.yml 配置加载，命令由配置定义，杜绝路径注入） */
+    private Map<String, CleanItem> buildCleanItems() {
         Map<String, CleanItem> map = new LinkedHashMap<>();
-        map.put("userTemp", new CleanItem("userTemp", "用户临时文件（%TEMP%）",
-                "删除当前用户临时文件夹中的文件，正在被占用的文件会自动跳过，不影响任何软件正常使用",
-                "cmd /c del /f /s /q \"%TEMP%\\*\" 2>nul & for /d %i in (\"%TEMP%\\*\") do @rd /s /q \"%i\" 2>nul",
-                true, null));
-        map.put("sysTemp", new CleanItem("sysTemp", "系统临时文件（C:\\Windows\\Temp）",
-                "删除系统临时文件夹中的文件，正在被占用的文件会自动跳过，需要一定系统权限，部分文件可能删不掉属正常现象",
-                "cmd /c del /f /s /q \"C:\\Windows\\Temp\\*\" 2>nul & for /d %i in (\"C:\\Windows\\Temp\\*\") do @rd /s /q \"%i\" 2>nul",
-                true, null));
-        map.put("wuCache", new CleanItem("wuCache", "Windows 更新缓存（SoftwareDistribution\\Download）",
-                "停止 Windows Update 服务后删除已下载的更新安装包缓存，再重新启动服务。已安装成功的更新不受影响",
-                "cmd /c net stop wuauserv 2>nul & del /f /s /q \"C:\\Windows\\SoftwareDistribution\\Download\\*\" 2>nul & net start wuauserv 2>nul",
-                true, null));
-        map.put("recycleBin", new CleanItem("recycleBin", "回收站",
-                "清空回收站，注意：回收站里的文件清空后将无法恢复，执行前请确认回收站内没有误删的重要文件",
-                "cmd /c powershell -NoProfile -Command \"Clear-RecycleBin -Force -ErrorAction SilentlyContinue\"",
-                true, null));
-        map.put("crashDump", new CleanItem("crashDump", "崩溃转储文件（MEMORY.DMP / Minidump）",
-                "删除系统蓝屏/崩溃产生的内存转储文件。如果近期有蓝屏且还需要分析原因，建议先不要清理",
-                "cmd /c del /f /q \"C:\\Windows\\MEMORY.DMP\" 2>nul & del /f /s /q \"C:\\Windows\\Minidump\\*\" 2>nul & del /f /s /q \"C:\\Windows\\LiveKernelReports\\*\" 2>nul",
-                true, null));
-        map.put("hibernate", new CleanItem("hibernate", "休眠文件（hiberfil.sys）",
-                "关闭休眠功能可释放与内存大小相当的C盘空间，但关闭后将无法使用休眠（快速启动也可能受影响）",
-                null, false,
-                "休眠文件需要管理员权限关闭，本工具不自动执行。如用户确认不再使用休眠，"
-                        + "请指导用户以管理员身份运行命令提示符执行 powercfg /h off，"
-                        + "或由用户在同意后通过终端命令工具执行（需确认）。"));
+        for (CleanItemProperties.Item item : cleanItemProperties.getItems()) {
+            map.put(item.getKey(), new CleanItem(
+                    item.getKey(),
+                    item.getName(),
+                    item.getImpact(),
+                    item.getCommand(),
+                    item.isAutoExecute(),
+                    item.getAdvice()));
+        }
         return map;
     }
 

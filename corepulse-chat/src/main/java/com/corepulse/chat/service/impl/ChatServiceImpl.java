@@ -46,7 +46,7 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class ChatServiceImpl implements ChatService {
 
-    private static final int MAX_HISTORY = 40;
+    private static final int MAX_HISTORY = 80;
     /** 历史中最多保留的工具执行记录条数：工具结果往往只对当轮有用，保留太多会撑爆上下文 */
     private static final int MAX_TOOL_RECORDS = 8;
 
@@ -112,13 +112,13 @@ public class ChatServiceImpl implements ChatService {
             //   1. 退避策略（指数退避）由框架管理，代码更简洁、更规范
             //   2. RetryTemplate 内部用 Thread.sleep 实现等待，但封装了中断处理等细节
             //   3. 语义清晰：RetryCallback 里"抛异常"就重试，"正常返回"就结束
-            // 退避策略：第 1 次失败等 3 秒，第 2 次失败等 6 秒（每次翻倍），最多重试 3 次
+            // 退避策略：首次等 5 秒，每次翻倍，上限 9 秒，最多重试 5 次
             // 为什么用指数退避而不是固定等待？
             //   1. 服务刚超时/报错时往往处于"过载"状态，立即重试大概率还是失败，反而加重负担
             //   2. 指数退避让等待时间随失败次数递增，给服务更多恢复时间，成功率更高
             RetryTemplate retryTemplate = RetryTemplate.builder()
-                    .maxAttempts(3)                    // 最多尝试 3 次（含首次）
-                    .exponentialBackoff(3000, 2, 6000) // 首次等 3 秒，每次翻倍，上限 6 秒
+                    .maxAttempts(5)                    // 最多尝试 5 次（含首次）
+                    .exponentialBackoff(3000, 3, 9000) // 首次等 5 秒，每次翻倍，上限 9 秒
                     .build();
             try {
                 // RetryCallback.doWithRetry 里写"一次尝试"的逻辑：
@@ -211,15 +211,18 @@ public class ChatServiceImpl implements ChatService {
         log.info("会话 {} 回复完成, replyLen={}", session.getId(), reply.length());
 
         // 8. 摘要只处理上次游标之后的消息；摘要失败时不推进游标
-        ChatSession currentSession = sessionMapper.selectById(sessionId);
-        Long lastSummarizedMessageId = currentSession.getLastSummarizedMessageId() == null
-                ? 0L : currentSession.getLastSummarizedMessageId();
+        //    【修复 2026-08-25】改用 session.getId()（始终非空，line 79 已创建/获取会话）代替
+        //    原始请求 sessionId。原代码在请求不带 sessionId（首条消息/本地会话）时
+        //    selectById(null) 返回 null，.getLastSummarizedMessageId() 触发 NPE，接口返回 500，前端走兜底提示。
+        ChatSession currentSession = sessionMapper.selectById(session.getId());
+        Long lastSummarizedMessageId = (currentSession == null || currentSession.getLastSummarizedMessageId() == null)
+        ? 0L : currentSession.getLastSummarizedMessageId();
         // 获取未摘要的消息
         List<ChatMessage> unsummarizedMessages = messageMapper.selectList(
-                new LambdaQueryWrapper<ChatMessage>()
-                        .eq(ChatMessage::getSessionId, sessionId)
-                        .gt(ChatMessage::getId, lastSummarizedMessageId)
-                        .orderByAsc(ChatMessage::getId)
+        new LambdaQueryWrapper<ChatMessage>()
+                .eq(ChatMessage::getSessionId, session.getId())
+                .gt(ChatMessage::getId, lastSummarizedMessageId)
+                .orderByAsc(ChatMessage::getId)
         );
 
         log.info("会话 {} 摘要游标={}, 未摘要消息数={}",
@@ -656,7 +659,7 @@ public class ChatServiceImpl implements ChatService {
                              List<Message> messages,
                              Long sessionId,
                              List<String> invokedTools) {
-        log.info("会话 {} 调用模型, messages={}, invokedTools={}", sessionId, messages, invokedTools);
+        log.info("会话 {} 调用模型 invokedTools={}", sessionId, invokedTools);
         ChatResponse response = chatClient.prompt()
                 .messages(messages)
                 .toolContext(Map.of("sessionId", sessionId))
