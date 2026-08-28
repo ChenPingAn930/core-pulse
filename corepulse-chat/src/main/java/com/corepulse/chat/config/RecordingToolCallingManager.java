@@ -58,15 +58,18 @@ public class RecordingToolCallingManager implements ToolCallingManager {
     public ToolExecutionResult executeToolCalls(Prompt prompt, ChatResponse chatResponse) {
         // 执行前推送 tool_started：此时 LLM 已决定调用哪些工具，名称与参数在输出消息的 toolCalls 中
         publishToolStarted(chatResponse);
-
+        // 执行工具调用 拿结果
         ToolExecutionResult result = delegate.executeToolCalls(prompt, chatResponse);
         // conversationHistory() 返回的是完整累积历史（含此前各轮内部循环的旧工具响应），
         // 只记录本次新增的：跳过数量 = 执行前 prompt 中已存在的 ToolResponseMessage 数，
         // 否则多轮工具调用时旧结果会被反复记录，造成数据库重复入库、历史窗口被重复记录挤占
         int existing = countToolResponses(prompt.getInstructions());
         int seen = 0;
+        //遍历所有消息
         for (Message message : result.conversationHistory()) {
+            // 如果是工具响应消息
             if (message instanceof ToolResponseMessage toolResponse) {
+                // 跳过已存在的工具响应
                 if (seen++ < existing) {
                     continue;
                 }

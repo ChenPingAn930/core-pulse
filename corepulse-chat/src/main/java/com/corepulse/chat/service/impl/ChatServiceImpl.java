@@ -227,8 +227,8 @@ public class ChatServiceImpl implements ChatService {
 
         log.info("会话 {} 摘要游标={}, 未摘要消息数={}",
                 session.getId(), lastSummarizedMessageId, unsummarizedMessages.size());
-        if (unsummarizedMessages.size() < 40) {
-            log.info("会话 {} 未摘要消息不足40条，不生成摘要", session.getId());
+        if (unsummarizedMessages.size() < 80) {
+            log.info("会话 {} 未摘要消息不足80条，不生成摘要", session.getId());
             return ChatSendVO.builder()
                     .sessionId(session.getId())
                     .reply(reply)
@@ -255,12 +255,22 @@ public class ChatServiceImpl implements ChatService {
         }
 
         try {
-            // 调用摘要生成模型
-            ChatResponse summaryResponse = primaryChatClient.prompt()
-                    .messages(summaryMessages)
-                    .system(PromptEnum.SUMMARY_GENERATION.getContent())
-                    .call()
-                    .chatResponse();
+            // 调用摘要生成模型，主模型失败时降级到备用模型
+            ChatResponse summaryResponse = null;
+            try {
+                summaryResponse = primaryChatClient.prompt()
+                        .messages(summaryMessages)
+                        .system(PromptEnum.SUMMARY_GENERATION.getContent())
+                        .call()
+                        .chatResponse();
+            } catch (Exception e) {
+                log.warn("会话 {} 主模型摘要生成失败，降级到备用模型: {}", session.getId(), e.getMessage());
+                summaryResponse = backupChatClient.prompt()
+                        .messages(summaryMessages)
+                        .system(PromptEnum.SUMMARY_GENERATION.getContent())
+                        .call()
+                        .chatResponse();
+            }
             String newSummary = summaryResponse.getResult() == null
                     || summaryResponse.getResult().getOutput() == null
                     ? null : summaryResponse.getResult().getOutput().getText();
