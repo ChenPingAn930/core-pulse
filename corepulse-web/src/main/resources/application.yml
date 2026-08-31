@@ -40,8 +40,8 @@ corepulse:
       model: Deepseek-v4-flash
       temperature: 0.7
     backup:
-      base-url: https://api.deepseek.com
-      api-key: ${DEEPSEEK_API_KEY}
+      base-url: https://token.sensenova.cn
+      api-key: ${SENSENOVA_API_KEY}
       model: deepseek-v4-flash
       temperature: 0.7
   # ==================== RAG 个人知识库配置 ====================
