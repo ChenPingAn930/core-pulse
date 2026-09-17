@@ -186,6 +186,10 @@ public class KnowledgeServiceImpl implements KnowledgeService {
             for (Resource resource : resolveKnowledgeResources()) {
                 chunks.addAll(loadChunks(resource));
             }
+
+            List<String> C = new ArrayList<>();
+            C.add("初始化检查");//这两行没有什么作用，就是我想学ArrayList的底层，所以加了这两行
+
             // 2. 空保护：一个片段都没有就说明文档为空/解析失败，直接返回
             if (chunks.isEmpty()) {
                 log.warn("知识库文档为空或解析失败, location={}", knowledgeLocation);

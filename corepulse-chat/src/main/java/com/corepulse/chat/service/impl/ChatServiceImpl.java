@@ -152,7 +152,7 @@ public class ChatServiceImpl implements ChatService {
                 success = true;
             } catch (Exception e) {
                 // 3 次都失败（或返回空回复）会走到这里，记录日志后走降级逻辑
-                log.warn("主模型调用 3 次均失败, 准备降级到备用模型: {}", e.getMessage());
+                log.warn("主模型调用 3 次均失败, 降级到备用模型: {}", e.getMessage());
             }
             if (!success) {
                 try {
