@@ -2,6 +2,7 @@ package com.corepulse.system.service.impl;
 
 import com.corepulse.domain.vo.SystemInfoVO;
 import com.corepulse.system.service.SystemInfoService;
+import com.corepulse.system.tool.CpuTemperatureReader;
 import com.corepulse.system.tool.GpuTemperatureReader;
 import lombok.extern.slf4j.Slf4j;
 import oshi.SystemInfo;
@@ -26,6 +27,9 @@ public class SystemInfoServiceImpl implements SystemInfoService {
     private final SystemInfo systemInfo = new SystemInfo();
     private final HardwareAbstractionLayer hal = systemInfo.getHardware();
     private final OperatingSystem os = systemInfo.getOperatingSystem();
+
+    @Autowired
+    private CpuTemperatureReader cpuTemperatureReader;
 
     @Autowired
     private GpuTemperatureReader gpuTemperatureReader;
@@ -246,10 +250,10 @@ public class SystemInfoServiceImpl implements SystemInfoService {
         double memUsage = round((memory.getTotal() - memory.getAvailable()) * 100.0 / memory.getTotal());
         vo.setMemUsage(memUsage);
 
-        // CPU 温度（可能不支持，取不到则为 null）
-        double temp = hal.getSensors().getCpuTemperature();
-        if (temp > 0) {
-            vo.setCpuTemp(round(temp));
+        // CPU 温度（多路径兜底：Win32_TemperatureProbe → 性能计数器 → CIM 新栈 → OSHI 兜底）
+        Double cpuTemp = cpuTemperatureReader.readCpuTemperature();
+        if (cpuTemp != null && cpuTemp > 0) {
+            vo.setCpuTemp(round(cpuTemp));
         }
 
         // GPU 温度（NVIDIA 用 nvidia-smi，AMD 用 WMI，读不到则为 null）
