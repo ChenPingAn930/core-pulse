@@ -106,8 +106,7 @@ public class ShellCommandTool implements SystemTool {
             @ToolParam(description = "是否已获得用户确认（危险命令需为 true），默认 false") Boolean confirmed,
             ToolContext toolContext) {
 
-        Long sessionId = toolContext != null
-                ? (Long) toolContext.getContext().get("sessionId")
+        Long sessionId = toolContext != null ? (Long) toolContext.getContext().get("sessionId")
                 : null;
         boolean isConfirmed = Boolean.TRUE.equals(confirmed);
 

@@ -107,4 +107,3 @@ logging:
   level:
     com.corepulse: debug
     org.springframework.ai.chat.client: debug
-    corepulse=debug: system.tool
