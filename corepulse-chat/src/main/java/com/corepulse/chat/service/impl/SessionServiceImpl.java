@@ -2,13 +2,14 @@ package com.corepulse.chat.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
-import com.corepulse.chat.mapper.ChatMessageMapper;
 import com.corepulse.chat.mapper.ChatSessionMapper;
 import com.corepulse.chat.model.vo.MessageVO;
 import com.corepulse.chat.model.vo.SessionVO;
 import com.corepulse.chat.service.SessionService;
 import com.corepulse.domain.entity.ChatMessage;
 import com.corepulse.domain.entity.ChatSession;
+import com.corepulse.domain.mapper.ChatMessageMapper;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -26,6 +27,7 @@ public class SessionServiceImpl implements SessionService {
 
     private final ChatSessionMapper sessionMapper;
     private final ChatMessageMapper messageMapper;
+    private final ObjectMapper objectMapper;
 
     /**
      * 创建新会话
@@ -102,12 +104,30 @@ public class SessionServiceImpl implements SessionService {
                         .content(m.getContent())
                         .toolName(m.getToolName())
                         .taskId(m.getTaskId())
-                        .extra(m.getExtra())
+                        .extra(parseExtra(m.getExtra()))
+                        .confirmed(m.getConfirmed())
+                        .status(m.getStatus())
                         .createdAt(m.getCreatedAt())
                         .build()
         ).toList();
         log.info("查询到的消息列表:{}", list);
         return Map.of("list", list, "total", p.getTotal());
+    }
+
+    /**
+     * extra 列是 JSON 字符串，转成对象返回，前端可直接用 extra.source 判断消息来源
+     * <p>解析失败时原样返回字符串，不因为脏数据让整个消息列表接口报错。
+     */
+    private Object parseExtra(String extra) {
+        if (extra == null || extra.isBlank()) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(extra, Map.class);
+        } catch (Exception e) {
+            log.warn("消息 extra 解析失败，按原始字符串返回: {}", extra);
+            return extra;
+        }
     }
 
     /**

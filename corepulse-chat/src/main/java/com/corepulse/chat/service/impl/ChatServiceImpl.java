@@ -7,7 +7,6 @@ import com.corepulse.chat.Enum.PromptEnum;
 import com.corepulse.chat.Enum.ReinstallGuideEnum;
 import com.corepulse.chat.config.RecordingToolCallingManager;
 import com.corepulse.chat.event.ChatEventPublisher;
-import com.corepulse.chat.mapper.ChatMessageMapper;
 import com.corepulse.chat.mapper.ChatSessionMapper;
 import com.corepulse.chat.model.dto.ChatSendRequest;
 import com.corepulse.chat.model.vo.ChatSendVO;
@@ -16,8 +15,11 @@ import com.corepulse.chat.service.ChatService;
 import com.corepulse.chat.service.SessionService;
 import com.corepulse.domain.entity.ChatMessage;
 import com.corepulse.domain.entity.ChatSession;
+import com.corepulse.domain.enums.CommandStatus;
 import com.corepulse.domain.enums.MessageRole;
+import com.corepulse.domain.mapper.ChatMessageMapper;
 import com.corepulse.system.tool.UninstallVerifyToolkit;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -65,6 +67,7 @@ public class ChatServiceImpl implements ChatService {
     private final KnowledgeService knowledgeService;
     private final ChatEventPublisher chatEventPublisher;
     private final UninstallVerifyToolkit uninstallVerifyToolkit;
+    private final ObjectMapper objectMapper;
 
     /**
      * 发送消息 - AI 对话核心流程
@@ -90,8 +93,9 @@ public class ChatServiceImpl implements ChatService {
             sessionService.update(session);
         }
 
-        // 3. 保存用户消息
-        saveMessage(session.getId(), MessageRole.USER.getValue(), content, null, null);
+        // 3. 保存用户消息（source 标记用于让前端区分"用户亲手输入"和"系统代发的确认消息"）
+        saveMessage(session.getId(), MessageRole.USER.getValue(), content, null, null,
+                buildSourceExtra(request.getSource()));
 
         // 4. 推送"思考中"事件：让前端在 LLM 处理期间实时看到当前阶段，而不是干等 HTTP 响应
         chatEventPublisher.publishThinking(session.getId(), "思考中");
@@ -117,7 +121,7 @@ public class ChatServiceImpl implements ChatService {
             //   1. 服务刚超时/报错时往往处于"过载"状态，立即重试大概率还是失败，反而加重负担
             //   2. 指数退避让等待时间随失败次数递增，给服务更多恢复时间，成功率更高
             RetryTemplate retryTemplate = RetryTemplate.builder()
-                    .maxAttempts(5)                    // 最多尝试 5 次（含首次）
+                    .maxAttempts(3)                    // 最多尝试 3 次（含首次）
                     .exponentialBackoff(3000, 3, 9000) // 首次等 5 秒，每次翻倍，上限 9 秒
                     .build();
             try {
@@ -423,6 +427,24 @@ public class ChatServiceImpl implements ChatService {
                     skippedToolRecords++;
                     continue;
                 }
+                // 命令确认记录不能渲染成"执行结果"：待确认/已确认未执行的命令如果被描述成结果，
+                // 模型会误以为已经执行完，直接回答"已删除/已完成"，不再调用工具
+                if (CommandStatus.PENDING.getValue().equals(m.getStatus())) {
+                    messages.add(new UserMessage("[待确认命令，尚未执行] " + m.getContent()
+                            + "（等待用户在界面上点击确认，确认前不要声称已经执行）"));
+                    continue;
+                }
+                if (CommandStatus.CONFIRMED.getValue().equals(m.getStatus())) {
+                    messages.add(new UserMessage("[用户已确认，等待执行] " + m.getContent()
+                            + "（用户已确认，请调用 runShellCommand 执行该命令，command 必须与原文一致）"));
+                    continue;
+                }
+                if (CommandStatus.EXECUTED.getValue().equals(m.getStatus())) {
+                    // 命令原文不是执行输出，别让模型把"命令"读成"执行结果"
+                    messages.add(new UserMessage("[已执行命令] " + m.getContent()
+                            + "（实际输出见后续工具执行记录）"));
+                    continue;
+                }
                 // 工具结果还原为上下文：因未保存原始 toolCallId，无法还原为 API 层 tool 消息，
                 // 以带前缀的普通消息形式注入，既避免消息配对校验报错，又能让 LLM 看到工具事实
                 messages.add(new UserMessage("[工具执行记录] 工具 " + m.getToolName()
@@ -453,12 +475,42 @@ public class ChatServiceImpl implements ChatService {
      */
     private void saveToolRecords(Long sessionId) {
         for (RecordingToolCallingManager.ToolCallRecord record : RecordingToolCallingManager.drainRecords()) {
-            String result = record.result() == null ? "" : record.result();
+            String result = unwrapToolResult(record.result());
+            // 空结果不入库（如 del 这类无输出命令），否则界面会出现空白工具块
+            if (result.isBlank()) {
+                continue;
+            }
+            // 命令确认提示是给模型当轮看的内部文本，前端已用确认卡片表达，
+            // 入库只会在上下文和界面里重复一遍
+            if (result.startsWith("【需要用户确认")) {
+                continue;
+            }
             if (result.length() > MAX_TOOL_RESULT_LENGTH) {
                 result = result.substring(0, MAX_TOOL_RESULT_LENGTH) + "...(已截断)";
             }
             saveMessage(sessionId, MessageRole.TOOL.getValue(), result, record.toolName(), null);
         }
+    }
+
+    /**
+     * 还原工具返回的字符串
+     * <p>
+     * Spring AI 记录 ToolResponse.responseData 时会把 String 返回值做一层 JSON 序列化，
+     * 数据库里实际是 "\"驱动器 C ...\"" 这种带首尾引号和转义的形式。
+     * 这里解包成原始文本，既让过滤判断（空结果/确认提示）能命中，也让上下文和界面更干净。
+     */
+    private String unwrapToolResult(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        if (raw.length() >= 2 && raw.startsWith("\"") && raw.endsWith("\"")) {
+            try {
+                return objectMapper.readValue(raw, String.class);
+            } catch (Exception e) {
+                return raw.substring(1, raw.length() - 1);
+            }
+        }
+        return raw;
     }
 
     /**
@@ -472,12 +524,23 @@ public class ChatServiceImpl implements ChatService {
      * @return 消息 ID
      */
     private Long saveMessage(Long sessionId, String role, String content, String toolName, Long taskId) {
+        return saveMessage(sessionId, role, content, toolName, taskId, null);
+    }
+
+    /**
+     * 保存一条聊天消息（可带附加标记）
+     *
+     * @param extra 附加信息的 JSON 字符串（写入 extra 列），无则 null
+     */
+    private Long saveMessage(Long sessionId, String role, String content, String toolName,
+                             Long taskId, String extra) {
         ChatMessage msg = new ChatMessage();
         msg.setSessionId(sessionId);
         msg.setRole(role);
         msg.setContent(content);
         msg.setToolName(toolName);
         msg.setTaskId(taskId);
+        msg.setExtra(extra);
         int insert = messageMapper.insert(msg);
         if (insert > 0)
             log.info("会话 {} 保存消息成功, role={}, content={}, toolName={}, taskId={}",
@@ -485,6 +548,17 @@ public class ChatServiceImpl implements ChatService {
         else
             log.warn("会话 {} 保存消息失败，未插入任何记录", sessionId);
         return msg.getId();
+    }
+
+    /**
+     * 把消息来源标记转成 extra JSON
+     * <p>source 只由后端内部传常量（如 command-confirm），不接受前端输入，无需转义。
+     */
+    private String buildSourceExtra(String source) {
+        if (source == null || source.isBlank()) {
+            return null;
+        }
+        return "{\"source\":\"" + source + "\"}";
     }
 
     /** 短确认/闲聊消息特征词（命中且消息很短时跳过 RAG 检索） */

@@ -1,6 +1,12 @@
 package com.corepulse.system.tool;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.corepulse.common.constant.RedisKeys;
+import com.corepulse.common.event.CommandConfirmNotifier;
+import com.corepulse.domain.entity.ChatMessage;
+import com.corepulse.domain.enums.CommandStatus;
+import com.corepulse.domain.mapper.ChatMessageMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.model.ToolContext;
@@ -35,11 +41,22 @@ import java.util.regex.Pattern;
 @RequiredArgsConstructor
 public class ShellCommandTool implements SystemTool {
 
+    private final ChatMessageMapper chatMessageMapper;
+
+    /** 待确认命令落库（独立事务，保证 WS 推送后记录已可见） */
+    private final CommandConfirmRecordService confirmRecordService;
+
+    /** 命令确认事件推送（common 域接口，实现由 web 模块提供） */
+    private final CommandConfirmNotifier commandConfirmNotifier;
+
     /** 输出最大长度（避免撑爆 LLM 上下文） */
     private static final int MAX_OUTPUT_LENGTH = 3000;
 
     /** 会话级只读授权有效期 */
     private static final Duration READONLY_AUTH_TTL = Duration.ofHours(24);
+
+    /** 命令记录在 t_chat_message 中的工具名（与 @Tool 的 name 一致，CommandConfirmRecordService 共用） */
+    static final String COMMAND_TOOL_NAME = "runShellCommand";
 
     /** 只读命令首词白名单（查询类，直接执行不弹确认） */
     private static final List<String> READONLY_FIRST_WORDS = List.of(
@@ -99,16 +116,15 @@ public class ShellCommandTool implements SystemTool {
      * @return 命令输出或确认请求
      */
     @Tool(name = "runShellCommand", description = "执行终端命令。command 为要执行的命令。只读查询命令（dir/wmic/tasklist/powershell 查询等）可直接执行；"
-            + "写操作/危险命令（rename/mklink/robocopy 覆盖/删除等）必须先向用户解释并展示命令原文，用户确认后将 confirmed 设为 true 再执行，"
-            + "会话授权只对只读查询命令生效，写操作仍需逐条确认。")
+            + "写操作/危险命令（rename/mklink/robocopy 覆盖/删除等）会由系统落库并等待用户在界面确认，"
+            + "工具会返回【需要用户确认】，此时向用户解释影响并展示命令原文即可，不要自行把 confirmed 设为 true 来绕过确认。"
+            + "用户确认后系统会自动发起新一轮调用，照常传入相同 command 与 confirmed=true 即可执行。")
     public String runShellCommand(
             @ToolParam(description = "要执行的终端命令") String command,
             @ToolParam(description = "是否已获得用户确认（危险命令需为 true），默认 false") Boolean confirmed,
             ToolContext toolContext) {
-
         Long sessionId = toolContext != null ? (Long) toolContext.getContext().get("sessionId")
                 : null;
-        boolean isConfirmed = Boolean.TRUE.equals(confirmed);
 
         // 1. 检查是否完全禁止的命令
         for (String forbidden : FORBIDDEN_KEYWORDS) {
@@ -124,29 +140,82 @@ public class ShellCommandTool implements SystemTool {
             return doExecute(command, sessionId);
         }
 
-        // 3. 检测是否为危险命令（危险命令始终逐条确认，不受会话授权影响）
-        if (isDangerous(command) && !isConfirmed) {
-            log.info("危险命令需要用户确认: command={}, sessionId={}", command, sessionId);
-            return "【需要用户确认】命令: " + command
-                    + "。请向用户解释这条命令执行后会发生什么，并展示命令原文，等待用户确认。"
-                    + "用户确认后，将 confirmed 设为 true 重新调用本工具执行。";
+        // 3. 写操作/危险命令：执行授权只能来自数据库，模型传的 confirmed 仅代表"申请执行"的意图，
+        //    不能作为授权依据 —— 否则模型自己填 true 就能绕过用户确认
+        if (sessionId == null) {
+            log.warn("无法获取会话 ID，写操作已拒绝: command={}", command);
+            return "无法获取会话 ID，写操作/危险命令已拒绝执行：" + command;
         }
 
-        // 4. 非危险的写类普通命令：一律逐条确认（会话授权仅限只读命令，不豁免写操作，
-        //    避免用户授权"读取命令不用问"后 rename/mklink 等被静默执行）
-        if (!isConfirmed) {
-            log.info("命令需用户确认（写操作不受会话授权豁免）: command={}, sessionId={}", command, sessionId);
-            return "【需要用户确认】命令: " + command
-                    + "。请向用户解释这条命令执行后会发生什么，并展示命令原文，等待用户确认。"
-                    + "用户确认后，将 confirmed 设为 true 重新调用本工具执行。"
-                    + "（若用户表示读取/查询类命令以后不用逐条询问，请调用 authorizeReadonlyCommands 记住授权。）";
+        ChatMessage approved = findConfirmedCommand(sessionId, command);
+        if (approved == null) {
+            // 已有一条"用户确认过但命令原文被改写"的记录：拒绝执行，避免确认 A 却执行 B
+            ChatMessage confirmedOther = findLatestConfirmedCommand(sessionId);
+            if (confirmedOther != null) {
+                log.warn("命令与用户确认的内容不一致，已拒绝: 期望={}, 实际={}", confirmedOther.getContent(), command);
+                return "【已拒绝执行】本次传入的命令与用户确认的命令不一致。用户确认的是："
+                        + confirmedOther.getContent() + "。请原样传入该命令，不要修改命令内容。";
+            }
+            // 用户还没确认过这条命令：独立事务落库（提交后再推送，前端点确认时一定查得到）
+            ChatMessage pending = confirmRecordService.savePending(sessionId, command);
+            log.info("命令已落库待用户确认: command={}, sessionId={}, messageId={}, 模型传confirmed={}",
+                    command, sessionId, pending.getId(), confirmed);
+            // 通过 WebSocket 推给前端，实时弹出确认卡片；推送失败不影响主流程
+            try {
+                commandConfirmNotifier.publishCommandConfirm(sessionId, pending.getId(), pending.getContent());
+            } catch (Exception e) {
+                log.warn("推送命令确认事件失败: messageId={}, error={}", pending.getId(), e.getMessage());
+            }
+            return "【需要用户确认，命令尚未执行】命令：" + command
+                    + "。已生成待确认记录（消息ID：" + pending.getId() + "），用户在界面上点击确认后才会执行。"
+                    + "请向用户解释这条命令执行后会发生什么并展示命令原文；"
+                    + "在用户确认前不要再次调用本工具，也不要声称命令已经执行。";
         }
 
-        // 用户本次确认即视为授权该会话后续非危险命令免确认
-        if (isConfirmed) {
-            grantReadonlyAuth(sessionId);
+        // 4. 先占位再执行：CONFIRMED -> EXECUTED 原子更新，
+        //    防止模型重试/用户重复点击导致同一条命令被执行多次
+        int claimed = chatMessageMapper.update(null, new LambdaUpdateWrapper<ChatMessage>()
+                .set(ChatMessage::getStatus, CommandStatus.EXECUTED.getValue())
+                .eq(ChatMessage::getId, approved.getId())
+                .eq(ChatMessage::getStatus, CommandStatus.CONFIRMED.getValue()));
+        if (claimed == 0) {
+            log.warn("命令已被执行或状态已变更，拒绝重复执行: command={}, messageId={}",
+                    command, approved.getId());
+            return "该命令已被执行或状态已变更，请勿重复执行：" + command;
         }
+
+        // 用户本次确认即视为授权该会话后续只读/查询命令免确认
+        grantReadonlyAuth(sessionId);
+        log.info("命令已获用户确认，开始执行: command={}, messageId={}", command, approved.getId());
         return doExecute(command, sessionId);
+    }
+
+    /**
+     * 查询用户已确认、尚未执行、且命令原文完全一致的记录
+     * <p>
+     * 必须比对命令原文：否则用户确认了 A 命令，模型把参数改成 B 命令再带 confirmed=true，
+     * 就会执行一条从未被确认过的命令。
+     */
+    private ChatMessage findConfirmedCommand(Long sessionId, String command) {
+        return chatMessageMapper.selectOne(new LambdaQueryWrapper<ChatMessage>()
+                .eq(ChatMessage::getSessionId, sessionId)
+                .eq(ChatMessage::getToolName, COMMAND_TOOL_NAME)
+                .eq(ChatMessage::getContent, command)
+                .eq(ChatMessage::getConfirmed, 1)
+                .eq(ChatMessage::getStatus, CommandStatus.CONFIRMED.getValue())
+                .orderByDesc(ChatMessage::getId)
+                .last("LIMIT 1"));
+    }
+
+    /** 查询该会话最新一条"用户已确认、尚未执行"的命令记录（用于识别命令被改写的情况） */
+    private ChatMessage findLatestConfirmedCommand(Long sessionId) {
+        return chatMessageMapper.selectOne(new LambdaQueryWrapper<ChatMessage>()
+                .eq(ChatMessage::getSessionId, sessionId)
+                .eq(ChatMessage::getToolName, COMMAND_TOOL_NAME)
+                .eq(ChatMessage::getConfirmed, 1)
+                .eq(ChatMessage::getStatus, CommandStatus.CONFIRMED.getValue())
+                .orderByDesc(ChatMessage::getId)
+                .last("LIMIT 1"));
     }
 
     /**

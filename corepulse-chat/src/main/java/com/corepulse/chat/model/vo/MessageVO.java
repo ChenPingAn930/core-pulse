@@ -37,6 +37,12 @@ public class MessageVO {
     /** 附加信息（如工具调用参数，无则 null） */
     private Object extra;
 
+    /** 是否已确认（0-否 1-是），仅命令记录有意义 */
+    private Integer confirmed;
+
+    /** 命令状态：PENDING-待确认 CONFIRMED-已确认待执行 EXECUTED-已执行；普通消息为 null */
+    private String status;
+
     /** 创建时间 */
     @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
     private LocalDateTime createdAt;

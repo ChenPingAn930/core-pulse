@@ -1,6 +1,7 @@
 package com.corepulse.web.websocket;
 
 import com.corepulse.chat.event.ChatEventPublisher;
+import com.corepulse.common.event.CommandConfirmNotifier;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -16,7 +17,7 @@ import java.util.Map;
 @Slf4j
 @Component
 @RequiredArgsConstructor
-public class WebSocketChatEventPublisher implements ChatEventPublisher {
+public class WebSocketChatEventPublisher implements ChatEventPublisher, CommandConfirmNotifier {
 
     private final WebSocketSessionManager sessionManager;
 
@@ -55,6 +56,24 @@ public class WebSocketChatEventPublisher implements ChatEventPublisher {
         event.put("sessionId", sessionId);
         event.put("toolName", toolName);
         event.put("summary", summary);
+        sessionManager.send(sessionId, event);
+    }
+
+    /**
+     * 推送"命令待确认"事件
+     * <p>
+     * 命令记录已经用独立事务提交，前端收到事件后可立即渲染确认卡片并调用确认接口。
+     */
+    @Override
+    public void publishCommandConfirm(Long sessionId, Long messageId, String command) {
+        if (sessionId == null || messageId == null) {
+            return;
+        }
+        Map<String, Object> event = new LinkedHashMap<>();
+        event.put("type", "command_confirm");
+        event.put("sessionId", sessionId);
+        event.put("messageId", messageId);
+        event.put("command", command);
         sessionManager.send(sessionId, event);
     }
 }

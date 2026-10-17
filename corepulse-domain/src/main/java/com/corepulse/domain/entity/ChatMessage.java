@@ -38,6 +38,16 @@ public class ChatMessage {
     /** 附加信息（如工具调用参数等，无则 null） */
     private String extra;
 
+    /** 是否已确认（0-未确认，1-已确认），仅命令类记录使用 */
+    private Integer confirmed;
+
+    /**
+     * 命令确认状态：PENDING / CONFIRMED / EXECUTED（见 CommandStatus）
+     * <p>普通消息为 null；命令类工具记录必须有值，用于区分
+     * "待确认"、"已确认未执行"、"已执行"，避免同一条命令被执行多次。
+     */
+    private String status;
+
     /** 创建时间 */
     private LocalDateTime createdAt;
 }
