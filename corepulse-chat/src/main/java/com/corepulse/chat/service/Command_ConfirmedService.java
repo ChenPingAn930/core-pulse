@@ -1,5 +1,7 @@
 package com.corepulse.chat.service;
 
+import com.corepulse.chat.model.vo.CommandStatusVO;
+
 /**
  * 危险命令确认
  */
@@ -12,4 +14,14 @@ public interface Command_ConfirmedService {
      * @return 给前端展示的结果文本
      */
     String Command_Confirmed(String messageid);
+
+    /**
+     * 查询命令记录的当前状态
+     * <p>
+     * 供前端在 WebSocket 断线、超时或页面重新聚焦时回查真实状态，作为事件通道的兜底。
+     *
+     * @param messageid 命令记录的消息 ID
+     * @return 状态信息；记录不存在时返回 null
+     */
+    CommandStatusVO queryStatus(String messageid);
 }

@@ -435,14 +435,26 @@ public class ChatServiceImpl implements ChatService {
                     continue;
                 }
                 if (CommandStatus.CONFIRMED.getValue().equals(m.getStatus())) {
-                    messages.add(new UserMessage("[用户已确认，等待执行] " + m.getContent()
-                            + "（用户已确认，请调用 runShellCommand 执行该命令，command 必须与原文一致）"));
+                    // 必须明确"用户已经点过确认"：否则模型会继续催用户去点确认，
+                    // 而此时前端卡片已经进入执行中，界面与回复互相矛盾
+                    messages.add(new UserMessage("[用户已在界面上确认，等待执行] " + m.getContent()
+                            + "（用户已确认，请立即调用 runShellCommand 执行该命令，command 必须与原文一致；不要再让用户确认）"));
+                    continue;
+                }
+                if (CommandStatus.EXECUTING.getValue().equals(m.getStatus())) {
+                    messages.add(new UserMessage("[命令正在执行，尚无结果] " + m.getContent()
+                            + "（命令已开始执行，不要声称已经完成，请等待工具返回执行结果）"));
                     continue;
                 }
                 if (CommandStatus.EXECUTED.getValue().equals(m.getStatus())) {
                     // 命令原文不是执行输出，别让模型把"命令"读成"执行结果"
                     messages.add(new UserMessage("[已执行命令] " + m.getContent()
                             + "（实际输出见后续工具执行记录）"));
+                    continue;
+                }
+                if (CommandStatus.FAILED.getValue().equals(m.getStatus())) {
+                    messages.add(new UserMessage("[命令执行失败] " + m.getContent()
+                            + "（该命令执行失败，输出见后续工具执行记录，请据此分析原因并给出替代方案）"));
                     continue;
                 }
                 // 工具结果还原为上下文：因未保存原始 toolCallId，无法还原为 API 层 tool 消息，

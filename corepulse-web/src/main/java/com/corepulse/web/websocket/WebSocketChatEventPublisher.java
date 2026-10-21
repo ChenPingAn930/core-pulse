@@ -76,4 +76,27 @@ public class WebSocketChatEventPublisher implements ChatEventPublisher, CommandC
         event.put("command", command);
         sessionManager.send(sessionId, event);
     }
+
+    /**
+     * 推送"命令状态变化"事件
+     * <p>
+     * 前端收到后按 messageId 更新对应确认卡片：EXECUTING 显示执行中并开始计时，
+     * EXECUTED / FAILED 停止计时并展示结果摘要。
+     * summary 已在工具侧截断，避免一次推送把整段命令输出塞进 WebSocket 帧。
+     */
+    @Override
+    public void publishCommandStatus(Long sessionId, Long messageId, String status,
+                                     String summary, Long costMs) {
+        if (sessionId == null || messageId == null) {
+            return;
+        }
+        Map<String, Object> event = new LinkedHashMap<>();
+        event.put("type", "command_status");
+        event.put("sessionId", sessionId);
+        event.put("messageId", messageId);
+        event.put("status", status);
+        event.put("summary", summary);
+        event.put("costMs", costMs);
+        sessionManager.send(sessionId, event);
+    }
 }

@@ -11,8 +11,11 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.retry.support.RetryTemplate;
+import org.springframework.web.client.RestClient;
 
+import java.time.Duration;
 import java.util.List;
 
 /**
@@ -77,9 +80,12 @@ public class ChatClientConfig {
      */
     @Bean
     public ChatModel primaryChatModel(RecordingToolCallingManager toolCallingManager) {
+        // 必须显式传 restClientBuilder：不传时 Spring AI 使用默认 RestClient，
+        // 底层请求没有连接/读取超时，上游不响应就会永久阻塞线程
         OpenAiApi api = OpenAiApi.builder()
                 .baseUrl(primaryBaseUrl)
                 .apiKey(primaryApiKey)
+                .restClientBuilder(timedRestClientBuilder())
                 .build();
 
         OpenAiChatOptions options = new OpenAiChatOptions();
@@ -90,7 +96,7 @@ public class ChatClientConfig {
                 api,
                 options,
                 toolCallingManager,
-                RetryTemplate.defaultInstance(),
+                singleAttemptRetry(),
                 ObservationRegistry.create()
         );
     }
@@ -106,9 +112,8 @@ public class ChatClientConfig {
         OpenAiApi api = OpenAiApi.builder()
                 .baseUrl(backupBaseUrl)
                 .apiKey(backupApiKey)
+                .restClientBuilder(timedRestClientBuilder())
                 .build();
-        System.out.println(">>> backupApiKey = " + backupApiKey);
-        System.out.println(">>> backupBaseUrl = " + backupBaseUrl);
         OpenAiChatOptions options = new OpenAiChatOptions();
         options.setModel(backupModel);
         options.setTemperature(backupTemperature);
@@ -117,9 +122,34 @@ public class ChatClientConfig {
                 api,
                 options,
                 toolCallingManager,
-                RetryTemplate.defaultInstance(),
+                singleAttemptRetry(),
                 ObservationRegistry.create()
         );
+    }
+
+    /**
+     * 带超时的 RestClient：连接 5s、读取 60s。
+     * <p>
+     * 为什么必须设：Spring AI 默认 REST 客户端不设超时，LLM 服务一旦不响应，
+     * 请求线程会无限挂起，接口永远不返回（前端看到的就是"一直执行中"）。
+     * 60 秒读取上限的取舍：足够生成较长的回复，又不至于让用户等上好几分钟。
+     */
+    private RestClient.Builder timedRestClientBuilder() {
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(Duration.ofSeconds(5));
+        factory.setReadTimeout(Duration.ofSeconds(60));
+        return RestClient.builder().requestFactory(factory);
+    }
+
+    /**
+     * 单次尝试的 RetryTemplate（不做内部重试）
+     * <p>
+     * 外层 ChatServiceImpl 已经有 3 次指数退避重试 + 备用模型降级，
+     * 若这里再用默认的 3 次，最坏耗时按乘法增长（3 × 3 × 超时时间），
+     * 用户会等到以为卡死。失败快速上抛，由外层统一决策。
+     */
+    private RetryTemplate singleAttemptRetry() {
+        return RetryTemplate.builder().maxAttempts(1).build();
     }
 
     /**

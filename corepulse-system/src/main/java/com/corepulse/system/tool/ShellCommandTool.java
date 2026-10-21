@@ -18,7 +18,11 @@ import org.springframework.stereotype.Component;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
@@ -52,17 +56,58 @@ public class ShellCommandTool implements SystemTool {
     /** 输出最大长度（避免撑爆 LLM 上下文） */
     private static final int MAX_OUTPUT_LENGTH = 3000;
 
+    /** 状态事件里的摘要长度上限（WebSocket 帧不宜过大，卡片也只展示一行） */
+    private static final int MAX_STATUS_SUMMARY_LENGTH = 200;
+
     /** 会话级只读授权有效期 */
     private static final Duration READONLY_AUTH_TTL = Duration.ofHours(24);
 
     /** 命令记录在 t_chat_message 中的工具名（与 @Tool 的 name 一致，CommandConfirmRecordService 共用） */
     static final String COMMAND_TOOL_NAME = "runShellCommand";
 
-    /** 只读命令首词白名单（查询类，直接执行不弹确认） */
+    /**
+     * 只读命令首词白名单（查询类，直接执行不弹确认）。
+     * <p>
+     * 含 findstr / find / more / sort：它们只从 stdin 读、往 stdout 写，是管道的"过滤段"，
+     * 只有把它们也认成只读，"tasklist | findstr xxx" 这类常见查询才能整条放行。
+     */
     private static final List<String> READONLY_FIRST_WORDS = List.of(
             "powershell", "dir", "wmic", "tasklist", "systeminfo",
-            "type", "where", "netstat", "ipconfig"
+            "type", "where", "netstat", "ipconfig",
+            "findstr", "find", "more", "sort"
     );
+
+    /**
+     * 子命令白名单：首词相同、读写取决于第二个词的命令。
+     * <p>
+     * 例如 reg query 只读、reg add 写入；sc query 只读、sc delete 删除；
+     * schtasks /query 只读、schtasks /delete 删除。表里没登记的第二个词一律按非只读处理。
+     */
+    private static final Map<String, Set<String>> READONLY_SUBCOMMANDS = Map.of(
+            "reg", Set.of("query"),
+            "sc", Set.of("query"),
+            "schtasks", Set.of("query", "/query")
+    );
+
+    /**
+     * 无害重定向：2&gt;nul、&gt;nul、&gt;&gt;nul、2&gt;&amp;1、1&gt;&amp;2。
+     * <p>
+     * 这类写法只是丢弃或合并输出流，不写文件系统。若不做剥离，
+     * "reg query ... 2&gt;nul" 这种最常见的静默查询会被整条误判为写操作。
+     * 注意只剥离目标是 nul / &amp;1 / &amp;2 的，重定向到真实文件仍按写操作处理。
+     */
+    private static final Pattern HARMLESS_REDIRECT =
+            // nul 后必须是空白或结尾：">nul.txt" 是写文件，不能被当成无害重定向放过
+            Pattern.compile("\\d?>>?\\s*(nul(?=\\s|$)|&[12])", Pattern.CASE_INSENSITIVE);
+
+    /**
+     * wmic 写操作特征：call 会真正启动进程，create / delete / terminate / set 会改系统状态。
+     * <p>
+     * 用词边界匹配而非"前后带空格的包含"：后者识别不到 "wmic process where name='x' delete"
+     * 这种写操作动词位于命令末尾的写法。
+     */
+    private static final Pattern WMIC_WRITE_PATTERN =
+            Pattern.compile("\\b(call|create|delete|terminate|set)\\b");
 
     /** PowerShell 写操作 cmdlet 特征（出现即不视为只读） */
     private static final List<String> PS_WRITE_MARKERS = List.of(
@@ -172,10 +217,11 @@ public class ShellCommandTool implements SystemTool {
                     + "在用户确认前不要再次调用本工具，也不要声称命令已经执行。";
         }
 
-        // 4. 先占位再执行：CONFIRMED -> EXECUTED 原子更新，
-        //    防止模型重试/用户重复点击导致同一条命令被执行多次
+        // 4. 先占位再执行：CONFIRMED -> EXECUTING 原子更新，
+        //    防止模型重试/用户重复点击导致同一条命令被执行多次。
+        //    这里不能直接置 EXECUTED：执行要几十秒，置了终态前端就没法区分"正在跑"和"跑完了"
         int claimed = chatMessageMapper.update(null, new LambdaUpdateWrapper<ChatMessage>()
-                .set(ChatMessage::getStatus, CommandStatus.EXECUTED.getValue())
+                .set(ChatMessage::getStatus, CommandStatus.EXECUTING.getValue())
                 .eq(ChatMessage::getId, approved.getId())
                 .eq(ChatMessage::getStatus, CommandStatus.CONFIRMED.getValue()));
         if (claimed == 0) {
@@ -187,7 +233,26 @@ public class ShellCommandTool implements SystemTool {
         // 用户本次确认即视为授权该会话后续只读/查询命令免确认
         grantReadonlyAuth(sessionId);
         log.info("命令已获用户确认，开始执行: command={}, messageId={}", command, approved.getId());
-        return doExecute(command, sessionId);
+
+        // 状态已提交后再推事件：前端收到事件立刻回查也能读到一致状态
+        notifyProgress(sessionId, approved.getId(), CommandStatus.EXECUTING, "命令已开始执行", null);
+
+        long startAt = System.currentTimeMillis();
+        ExecResult result = executeCommand(command);
+        long costMs = System.currentTimeMillis() - startAt;
+        CommandStatus finalStatus = result.success() ? CommandStatus.EXECUTED : CommandStatus.FAILED;
+
+        // 终态回写同样带条件：只允许从 EXECUTING 迁移，避免并发下互相覆盖
+        chatMessageMapper.update(null, new LambdaUpdateWrapper<ChatMessage>()
+                .set(ChatMessage::getStatus, finalStatus.getValue())
+                .eq(ChatMessage::getId, approved.getId())
+                .eq(ChatMessage::getStatus, CommandStatus.EXECUTING.getValue()));
+
+        log.info("命令执行结束: messageId={}, status={}, exitCode={}, costMs={}",
+                approved.getId(), finalStatus, result.exitCode(), costMs);
+        // 摘要截断后再推：完整输出可能很长，也可能含用户路径等个人信息
+        notifyProgress(sessionId, approved.getId(), finalStatus, summarize(result), costMs);
+        return truncate(result.output(), MAX_OUTPUT_LENGTH);
     }
 
     /**
@@ -240,66 +305,196 @@ public class ShellCommandTool implements SystemTool {
         return "已记住授权：本次会话内只读/查询类命令将直接执行，不再逐条询问。请告知用户授权已生效。";
     }
 
-    /** 实际执行命令并返回截断后的输出 */
+    /** 实际执行命令并返回截断后的输出（只读分支直接调用，不需要状态推送） */
     private String doExecute(String command, Long sessionId) {
         log.info("执行终端命令: command={}, sessionId={}", command, sessionId);
-        String output = executeCommand(command);
-        log.info("命令执行完成: command={}, 输出长度={}", command, output.length());
-        return truncate(output, MAX_OUTPUT_LENGTH);
+        ExecResult result = executeCommand(command);
+        log.info("命令执行完成: command={}, exitCode={}, 输出长度={}",
+                command, result.exitCode(), result.output().length());
+        return truncate(result.output(), MAX_OUTPUT_LENGTH);
+    }
+
+    /**
+     * 推送命令状态（执行中 / 成功 / 失败）
+     * <p>
+     * 推送失败只记 warn：前端还有轮询兜底，不能因为推不出去就影响命令本身的执行与状态落库。
+     */
+    private void notifyProgress(Long sessionId, Long messageId, CommandStatus status,
+                                String summary, Long costMs) {
+        if (sessionId == null || messageId == null) {
+            return;
+        }
+        try {
+            commandConfirmNotifier.publishCommandStatus(
+                    sessionId, messageId, status.getValue(), summary, costMs);
+        } catch (Exception e) {
+            log.warn("推送命令状态失败: messageId={}, status={}, error={}",
+                    messageId, status, e.getMessage());
+        }
+    }
+
+    /** 生成给前端展示的一句摘要：成功/失败 + 退出码 + 输出前若干字符 */
+    private String summarize(ExecResult result) {
+        String prefix = result.success()
+                ? "执行成功（退出码 0）"
+                : "执行失败（退出码 " + result.exitCode() + "）";
+        String body = result.output() == null ? "" : result.output().trim();
+        if (body.isEmpty()) {
+            return prefix;
+        }
+        // 压成单行：卡片只有一行摘要位置，多行原文已经在命令区展示过
+        String oneLine = truncate(body, MAX_STATUS_SUMMARY_LENGTH)
+                .replace("\r", " ")
+                .replace("\n", " ")
+                .trim();
+        return prefix + "：" + oneLine;
+    }
+
+    /** 命令执行结果：success 以退出码为准，启动异常按失败处理并给出 -1 */
+    record ExecResult(boolean success, int exitCode, String output) {
     }
 
     /**
      * 判断命令是否为纯只读查询命令
      * <p>
-     * 条件：首词属于查询类白名单，且不含输出重定向、不含命令拼接、不含危险词；
-     * powershell 开头时还需不含写操作 cmdlet。
+     * 从"只要含拼接/管道就一票否决"改为"分段逐段校验"：cmd 的 &amp; / &amp;&amp; / || / | 只是把多条命令串起来，
+     * 整条是否只读取决于每一段是否只读。常见写法 "reg query ... 2&gt;nul &amp; reg query ..." 和
+     * "tasklist | findstr xxx" 因此能正常放行，而 "dir &amp; del x" 仍会因 del 段不合法被拦住。
+     * <p>
+     * 判定顺序（任一不满足即非只读）：
+     * 1. 剔除无害重定向（2&gt;nul / &gt;nul / 2&gt;&amp;1）后仍残留 &gt; 或 &lt; —— 说明在写真实文件，拒绝
+     * 2. 出现 ^ 转义符 —— 拆分结果可能与实际执行不一致，拒绝
+     * 3. 按 &amp; &amp;&amp; || | 拆段，每段都必须通过 isReadOnlySegment
      */
     private boolean isReadOnly(String command) {
-        String lower = command.trim().toLowerCase();
-        if (lower.isEmpty()) {
+        if (command == null) {
             return false;
         }
-        // 输出重定向 / & 命令拼接会引入写操作风险，一律不视为只读
-        if (lower.contains(">") || lower.contains("&")) {
+        String lower = HARMLESS_REDIRECT.matcher(command.trim()).replaceAll(" ")
+                .toLowerCase(Locale.ROOT);
+        if (lower.isBlank()) {
             return false;
         }
-        String firstWord = lower.split("[\\s]+", 2)[0];
-        // 精细识别 sc / reg 的"查询子命令"：sc query、reg query 是只读查询，直接执行；
-        // 但 sc delete、reg add 等写操作不视为只读（会被 isDangerous 拦截或走确认流程）
-        if ("sc".equals(firstWord) || "reg".equals(firstWord)) {
-            String secondWord = lower.split("[\\s]+", 3).length > 1
-                    ? lower.split("[\\s]+", 3)[1]
-                    : "";
-            if (!"query".equals(secondWord)) {
-                return false;  // sc/reg 非 query 子命令，不视为只读
+        // ^ 是 cmd 的转义符（如 ^& 表示字面 &），出现即放弃解析：宁可多问一句，也不猜
+        if (lower.contains("^")) {
+            return false;
+        }
+        // 引号必须成对，否则无法确定 cmd 把哪段当字符串
+        if (lower.chars().filter(c -> c == '"').count() % 2 != 0) {
+            return false;
+        }
+        for (String segment : splitCommand(lower)) {
+            if (!isReadOnlySegment(segment)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 按 cmd 的命令分隔符拆段：&amp;（顺序执行）、&amp;&amp;（前一条成功才执行）、||（前一条失败才执行）、|（管道）。
+     * 连续分隔符按一个处理，空段会在 isReadOnlySegment 里被判为非只读。
+     * <p>
+     * 双引号内的分隔符不拆：cmd 不解析引号内的 &amp; 和 |，它们会原样传给子进程
+     * （如 powershell -Command "a | b" 里的 | 是 PowerShell 管道，不是 cmd 管道）。
+     * 只认双引号——cmd 里单引号不是引号字符，'a &amp; del x' 仍会被 cmd 拆成两条命令，
+     * 因此单引号必须照常参与拆分，否则会留下一条可绕过校验的命令。
+     */
+    private List<String> splitCommand(String lower) {
+        List<String> segments = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuote = false;
+        for (int i = 0; i < lower.length(); i++) {
+            char c = lower.charAt(i);
+            if (c == '"') {
+                inQuote = !inQuote;
+                current.append(c);
+                continue;
+            }
+            if (!inQuote && (c == '&' || c == '|')) {
+                segments.add(current.toString().trim());
+                current.setLength(0);
+                while (i + 1 < lower.length()
+                        && (lower.charAt(i + 1) == '&' || lower.charAt(i + 1) == '|')) {
+                    i++;
+                }
+            } else {
+                current.append(c);
+            }
+        }
+        segments.add(current.toString().trim());
+        return segments;
+    }
+
+    /** 校验单段命令是否只读：无残留重定向 + 首词（或子命令）在白名单 + 不含危险词/写操作特征 */
+    private boolean isReadOnlySegment(String segment) {
+        if (segment.isEmpty()) {
+            return false;
+        }
+        // 无害重定向已在入口剥离，这里还出现 > < 说明在读写真实文件
+        if (segment.indexOf('>') >= 0 || segment.indexOf('<') >= 0) {
+            return false;
+        }
+        String[] tokens = segment.split("\\s+");
+        // 首词归一化：Windows 上同一命令常带扩展名（where.exe / tasklist.exe / reg.exe），
+        // 白名单按裸命令名登记，不剥离扩展名就永远匹配不上，只会被误判成写操作
+        String firstWord = stripExecutableSuffix(tokens[0]);
+        Set<String> allowedSubCommands = READONLY_SUBCOMMANDS.get(firstWord);
+        if (allowedSubCommands != null) {
+            // 读写同名的命令只认登记过的子命令：reg query 放行，reg add / sc delete 拒绝
+            if (tokens.length < 2 || !allowedSubCommands.contains(tokens[1])) {
+                return false;
             }
         } else if (!READONLY_FIRST_WORDS.contains(firstWord)) {
             return false;
         }
-        // 管道：仅 powershell 内查询 cmdlet 间管道放行（各段已由危险词/写 cmdlet 检查覆盖），
-        // 其他命令的管道可能接危险程序，不视为只读
-        if (lower.contains("|") && !"powershell".equals(firstWord)) {
+        if (isDangerous(segment)) {
             return false;
         }
-        if (isDangerous(lower)) {
+        if ("powershell".equals(firstWord) && containsAny(segment, PS_WRITE_MARKERS)) {
             return false;
         }
-        if ("powershell".equals(firstWord)) {
-            for (String marker : PS_WRITE_MARKERS) {
-                if (lower.contains(marker)) {
-                    return false;
-                }
-            }
+        if ("wmic".equals(firstWord) && WMIC_WRITE_PATTERN.matcher(segment).find()) {
+            return false;
         }
         return true;
+    }
+
+    /**
+     * 去掉命令名末尾的 .exe / .com / .bat / .cmd 后缀，让 where.exe 与 where 等价
+     * <p>
+     * 只处理首词，且只认这四种可执行后缀：白名单之外的名字（如 cmd.exe）剥离后仍然不在名单内，
+     * 危险词检查也依旧针对命令原文，不会因此放宽。
+     */
+    private String stripExecutableSuffix(String token) {
+        int dot = token.lastIndexOf('.');
+        if (dot <= 0 || dot == token.length() - 1) {
+            return token;
+        }
+        String ext = token.substring(dot + 1);
+        boolean executable = "exe".equals(ext) || "com".equals(ext)
+                || "bat".equals(ext) || "cmd".equals(ext);
+        return executable ? token.substring(0, dot) : token;
+    }
+
+    /** 是否命中任一特征词（特征词自带分隔符或边界语义，直接用包含判断） */
+    private boolean containsAny(String text, List<String> markers) {
+        for (String marker : markers) {
+            if (text.contains(marker)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** 判断命令是否为危险命令（按词边界匹配，避免子串误报） */
     private boolean isDangerous(String command) {
         String lower = command.toLowerCase();
         for (String keyword : DANGEROUS_KEYWORDS) {
-            // \b 词边界：format 不会命中 Format-Table，ren 不会命中普通单词内部
-            if (Pattern.compile("\\b" + Pattern.quote(keyword) + "\\b").matcher(lower).find()) {
+            // \b 词边界：ren 不会命中普通单词内部；
+            // (?!-) 排除 PowerShell 的 Verb-Noun 形式 cmdlet：Format-List 是只读的格式化命令，
+            // 不能被危险词 format（格式化磁盘）误伤
+            if (Pattern.compile("\\b" + Pattern.quote(keyword) + "\\b(?!-)").matcher(lower).find()) {
                 return true;
             }
         }
@@ -333,22 +528,23 @@ public class ShellCommandTool implements SystemTool {
 
     /** 执行 cmd 命令：前置 chcp 65001 让支持代码页的命令（dir 等 cmd 内置命令）按 UTF-8 输出；
      *  robocopy 等老式工具无视代码页仍按系统 ANSI 输出，因此先按 UTF-8 解码，
-     *  出现替换符（乱码特征）时对同一份字节改用 GBK 解码，命令只执行一次 */
-    private String executeCommand(String command) {
+     *  出现替换符（乱码特征）时对同一份字节改用 GBK 解码，命令只执行一次；
+     *  返回退出码，供上层判定 EXECUTED / FAILED */
+    private ExecResult executeCommand(String command) {
         try {
             ProcessBuilder pb = new ProcessBuilder("cmd.exe", "/c", "chcp 65001 >nul & " + command);
             pb.redirectErrorStream(true);
             Process process = pb.start();
             byte[] bytes = process.getInputStream().readAllBytes();
-            process.waitFor();
+            int exitCode = process.waitFor();
             String output = new String(bytes, StandardCharsets.UTF_8);
             if (output.indexOf('\uFFFD') >= 0) {
                 output = new String(bytes, Charset.forName("GBK"));
             }
-            return output.trim();
+            return new ExecResult(exitCode == 0, exitCode, output.trim());
         } catch (Exception e) {
             log.error("命令执行失败: {}", command, e);
-            return "命令执行失败: " + e.getMessage();
+            return new ExecResult(false, -1, "命令执行失败: " + e.getMessage());
         }
     }
 
