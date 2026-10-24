@@ -10,9 +10,12 @@ import com.corepulse.chat.event.ChatEventPublisher;
 import com.corepulse.chat.mapper.ChatSessionMapper;
 import com.corepulse.chat.model.dto.ChatSendRequest;
 import com.corepulse.chat.model.vo.ChatSendVO;
+import com.corepulse.chat.model.vo.PendingCommandVO;
 import com.corepulse.chat.rag.KnowledgeService;
 import com.corepulse.chat.service.ChatService;
+import com.corepulse.chat.service.CommandPendingService;
 import com.corepulse.chat.service.SessionService;
+import com.corepulse.common.event.CommandConfirmNotifier;
 import com.corepulse.domain.entity.ChatMessage;
 import com.corepulse.domain.entity.ChatSession;
 import com.corepulse.domain.enums.CommandStatus;
@@ -69,6 +72,24 @@ public class ChatServiceImpl implements ChatService {
     private final UninstallVerifyToolkit uninstallVerifyToolkit;
     private final ObjectMapper objectMapper;
 
+    /** 待确认命令门面：用于校验"模型说需要确认"到底有没有真实的待确认记录 */
+    private final CommandPendingService commandPendingService;
+
+    /** 卡片事件推送：新消息时补推历史待确认卡片（common 域接口，实现由 web 模块提供） */
+    private final CommandConfirmNotifier commandConfirmNotifier;
+
+    /**
+     * 模型"要求用户去点确认卡片"的话术特征
+     * <p>
+     * 不能只匹配工具原文那一句：模型会改写成"需要你在界面确认卡片上点击确认"，
+     * 字面完全不同、语义一模一样，用户照样会去找一张不存在的卡片。
+     * 这里只收"指向本系统确认卡片"的措辞，不收泛化的"点击确认"——
+     * 后者在讲解手动卸载向导时也会出现，误判把正常回答改掉。
+     */
+    private static final List<String> CONFIRM_CLAIM_MARKERS = List.of(
+            "确认卡片", "需要用户确认", "待确认记录", "在界面上确认",
+            "确认后才会执行", "确认后才会真正执行");
+
     /**
      * 发送消息 - AI 对话核心流程
      * <p>
@@ -97,6 +118,10 @@ public class ChatServiceImpl implements ChatService {
         saveMessage(session.getId(), MessageRole.USER.getValue(), content, null, null,
                 buildSourceExtra(request.getSource()));
 
+        // 3.5 补推历史待确认卡片：卡片只靠一次性事件渲染，推送失败或前端没连上时就会永久丢失，
+        // 用户发下一条消息时顺手补一次。前端应按 messageId 去重，避免同一条命令出现两张卡片
+        repushPendingCards(session.getId());
+
         // 4. 推送"思考中"事件：让前端在 LLM 处理期间实时看到当前阶段，而不是干等 HTTP 响应
         chatEventPublisher.publishThinking(session.getId(), "思考中");
 
@@ -110,6 +135,8 @@ public class ChatServiceImpl implements ChatService {
         List<String> invokedTools = new ArrayList<>();
         RecordingToolCallingManager.setCurrentSession(session.getId());
         boolean success = false;
+        // 本轮是否真的产生过"需要用户确认"的工具返回（由 saveToolRecords 在 finally 里回填）
+        boolean confirmationRequested = false;
         try {
             // 主模型重试：用 Spring Retry 的 RetryTemplate 替代手写 for 循环 + Thread.sleep
             // 为什么用 RetryTemplate 而不是手写循环？
@@ -181,8 +208,9 @@ public class ChatServiceImpl implements ChatService {
         } finally {
             // 取出本轮内部循环中执行过的工具调用结果并存入历史（role=tool），
             // 使跨轮次时 LLM 能看到上一轮工具的真实输出（如 taskId、扫描数据）；
-            // 无论成功失败都需 drain，防止线程复用时串数据
-            saveToolRecords(session.getId());
+            // 无论成功失败都需 drain，防止线程复用时串数据。
+            // 返回值表示本轮是否真有命令走到"待用户确认"，用于识别模型的口头确认
+            confirmationRequested = saveToolRecords(session.getId());
             RecordingToolCallingManager.clearCurrentSession();
         }
         // 记录最终回复这一轮是否还有工具调用
@@ -208,6 +236,30 @@ public class ChatServiceImpl implements ChatService {
             String verifyJson = tryRunVerify(request.getContent(), session.getId());
             reply = "本轮缺少卸载后校验，已由系统代为执行 verifyUninstallApp，结果如下：\n" + verifyJson
                     + "\n（请确认并告知用户：clean 为 false 时残留清单见上，是否清理请征得用户同意。）";
+        }
+
+        // 6.6 确认卡片存在性仲裁：模型回复里说"需要用户确认"，但库里没有有效待确认记录 → 它在背稿
+        // 原理：PromptEnum 里教过它确认文案，模型完全可以不调工具、直接复述这句话，
+        // 用户照着提示去点卡片却发现根本没有卡片。这里只做"是否存在"的校验，
+        // 绝不从回复文本里反推命令自动补建记录 —— 那会造成"用户确认 A、实际执行 B"的新漏洞。
+        String confirmClaim = CONFIRM_CLAIM_MARKERS.stream()
+                .filter(reply::contains)
+                .findFirst()
+                .orElse(null);
+        if (confirmClaim != null) {
+            // 两个信号缺一不可地"或"起来，是因为它们各自会漏：
+            // 1. confirmationRequested —— 本轮工具真实返回过"需要用户确认"，内存信号，不受事务可见性影响；
+            // 2. hasValidPending —— 库里确实存在有效记录，能覆盖"引用上一轮旧卡片"的场景。
+            // 为什么要两个都看：send() 在事务里（REPEATABLE READ），快照在 buildMessages 首次查询时就固定了；
+            // 而待确认记录是本轮用 REQUIRES_NEW 另开事务插进去的，对本事务的快照不可见，
+            // 只查库会得出"没有卡片"的错误结论，把明明已经弹出卡片的一轮改成"提交失败"
+            boolean cardExists = confirmationRequested || commandPendingService.hasValidPending(session.getId());
+            if (!cardExists) {
+                log.warn("[确认卡片拦截] 会话 {} 回复声称需要确认(命中措辞:{}), 但本轮无确认返回且库中无有效记录",
+                        session.getId(), confirmClaim);
+                reply = "这条命令没有真正提交到系统，因此界面上不会出现确认卡片，我也不会执行它。"
+                        + "请重新发送一次指令，我会重新提交执行申请，再由你在卡片上确认。";
+            }
         }
 
         // 7. 保存 AI 回复
@@ -430,20 +482,29 @@ public class ChatServiceImpl implements ChatService {
                 // 命令确认记录不能渲染成"执行结果"：待确认/已确认未执行的命令如果被描述成结果，
                 // 模型会误以为已经执行完，直接回答"已删除/已完成"，不再调用工具
                 if (CommandStatus.PENDING.getValue().equals(m.getStatus())) {
+                    // 状态已被定时任务收敛成 EXPIRED 的记录走下面的分支；
+                    // 这里还要覆盖"已超时但还没被扫描到"的窗口期，否则模型会催用户去点一张已经失效的卡片
+                    if (m.getCreatedAt() != null && m.getCreatedAt().isBefore(commandPendingService.timeoutCutoff())) {
+                        messages.add(new UserMessage("[命令已超时未执行] " + m.getContent()
+                                + "（用户未在确认时限内点击确认，命令已失效，从未执行。"
+                                + "如需执行请重新提交命令并生成新的确认卡片）"));
+                        continue;
+                    }
                     messages.add(new UserMessage("[待确认命令，尚未执行] " + m.getContent()
                             + "（等待用户在界面上点击确认，确认前不要声称已经执行）"));
                     continue;
                 }
                 if (CommandStatus.CONFIRMED.getValue().equals(m.getStatus())) {
                     // 必须明确"用户已经点过确认"：否则模型会继续催用户去点确认，
-                    // 而此时前端卡片已经进入执行中，界面与回复互相矛盾
-                    messages.add(new UserMessage("[用户已在界面上确认，等待执行] " + m.getContent()
-                            + "（用户已确认，请立即调用 runShellCommand 执行该命令，command 必须与原文一致；不要再让用户确认）"));
+                    // 而此时前端卡片已经进入执行中，界面与回复互相矛盾。
+                    // 也不能再让模型调用工具执行：确认后由后端直接执行，模型重复调用只会增加一轮无效 LLM
+                    messages.add(new UserMessage("[用户已在界面上确认，系统即将执行] " + m.getContent()
+                            + "（用户已确认，命令由系统直接执行，不需要也不要再次调用 runShellCommand）"));
                     continue;
                 }
                 if (CommandStatus.EXECUTING.getValue().equals(m.getStatus())) {
                     messages.add(new UserMessage("[命令正在执行，尚无结果] " + m.getContent()
-                            + "（命令已开始执行，不要声称已经完成，请等待工具返回执行结果）"));
+                            + "（命令正在执行中，不要声称已经完成，执行结果会写入会话）"));
                     continue;
                 }
                 if (CommandStatus.EXECUTED.getValue().equals(m.getStatus())) {
@@ -455,6 +516,14 @@ public class ChatServiceImpl implements ChatService {
                 if (CommandStatus.FAILED.getValue().equals(m.getStatus())) {
                     messages.add(new UserMessage("[命令执行失败] " + m.getContent()
                             + "（该命令执行失败，输出见后续工具执行记录，请据此分析原因并给出替代方案）"));
+                    continue;
+                }
+                if (CommandStatus.EXPIRED.getValue().equals(m.getStatus())) {
+                    // 必须说清"没执行"，否则模型会把超时当成执行失败去编原因，
+                    // 或者继续催用户去点一张早已失效的卡片
+                    messages.add(new UserMessage("[命令已超时未执行] " + m.getContent()
+                            + "（用户未在确认时限内点击确认，命令已失效，从未执行。"
+                            + "如需执行请重新提交命令并生成新的确认卡片，不要催用户去点旧卡片）"));
                     continue;
                 }
                 // 工具结果还原为上下文：因未保存原始 toolCallId，无法还原为 API 层 tool 消息，
@@ -478,14 +547,39 @@ public class ChatServiceImpl implements ChatService {
     }
 
     /**
+     * 补推仍然有效的待确认卡片（事件通道兜底）
+     * <p>
+     * 为什么需要它：确认卡片是 WebSocket 单次事件渲染出来的，事件丢了前端就永远看不到卡片，
+     * 而对话正文里还写着"请在卡片上确认"。以数据库为准补推一次，是成本最低的自愈方式。
+     * <p>
+     * 注意：本方法在 send() 的事务内执行，只能读、不能改状态。子事务（savePending）也是插同一张表，
+     * 父事务一旦持有范围 UPDATE 的间隙锁，子事务的插入就会一直等父事务提交，最终锁等待超时。
+     *
+     * @param sessionId 会话 ID
+     */
+    private void repushPendingCards(Long sessionId) {
+        try {
+            List<PendingCommandVO> pending = commandPendingService.listValidPending(sessionId);
+            for (PendingCommandVO item : pending) {
+                commandConfirmNotifier.publishCommandConfirm(
+                        sessionId, item.getMessageId(), item.getCommand());
+            }
+        } catch (Exception e) {
+            log.warn("补推待确认卡片失败: sessionId={}, error={}", sessionId, e.getMessage());
+        }
+    }
+
+    /**
      * 保存本轮对话中执行过的工具调用结果（role=tool）
      * <p>
      * 工具结果由 RecordingToolCallingManager 在 ChatClient 内部工具循环中记录，
      * 这里取出后截断入库，保证历史上下文不被大输出撑爆。
      *
      * @param sessionId 所属会话 ID
+     * @return true 表示本轮确实有一条命令走到了"待用户确认"（即界面上应该出现卡片）
      */
-    private void saveToolRecords(Long sessionId) {
+    private boolean saveToolRecords(Long sessionId) {
+        boolean confirmationRequested = false;
         for (RecordingToolCallingManager.ToolCallRecord record : RecordingToolCallingManager.drainRecords()) {
             String result = unwrapToolResult(record.result());
             // 空结果不入库（如 del 这类无输出命令），否则界面会出现空白工具块
@@ -493,8 +587,11 @@ public class ChatServiceImpl implements ChatService {
                 continue;
             }
             // 命令确认提示是给模型当轮看的内部文本，前端已用确认卡片表达，
-            // 入库只会在上下文和界面里重复一遍
+            // 入库只会在上下文和界面里重复一遍。
+            // 这条分支同时是"确认卡片真的产生了"的唯一可信信号：它只可能来自工具的返回值，
+            // 模型自己写的文字不会进 ToolCallRecord，所以能用来识别口头确认。
             if (result.startsWith("【需要用户确认")) {
+                confirmationRequested = true;
                 continue;
             }
             if (result.length() > MAX_TOOL_RESULT_LENGTH) {
@@ -502,6 +599,7 @@ public class ChatServiceImpl implements ChatService {
             }
             saveMessage(sessionId, MessageRole.TOOL.getValue(), result, record.toolName(), null);
         }
+        return confirmationRequested;
     }
 
     /**

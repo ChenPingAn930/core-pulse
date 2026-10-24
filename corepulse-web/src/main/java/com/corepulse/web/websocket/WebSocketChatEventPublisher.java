@@ -60,6 +60,30 @@ public class WebSocketChatEventPublisher implements ChatEventPublisher, CommandC
     }
 
     /**
+     * 推送后台推理产生的助手回复
+     * <p>
+     * 与 HTTP 响应二选一：只有"没有 HTTP 请求承接回复"的场景（命令结果播报）才调这里，
+     * 否则同一句话会在界面上出现两次。
+     */
+    @Override
+    public void publishAssistantReply(Long sessionId, String content) {
+        if (sessionId == null || content == null || content.isBlank()) {
+            return;
+        }
+        Map<String, Object> event = new LinkedHashMap<>();
+        event.put("type", "assistant_reply");
+        event.put("sessionId", sessionId);
+        event.put("content", content);
+        boolean sent = sessionManager.send(sessionId, event);
+        if (!sent) {
+            // 推不出去时把事实写清楚：回复已经入库，前端刷新/重新拉历史能看到，
+            // 但实时推送这一帧丢了。没有这行日志，"后端说推了、用户说没收到"只能靠猜
+            log.warn("助手回复未能实时推送(已入库, 刷新可见): sessionId={}, replyLen={}",
+                    sessionId, content.length());
+        }
+    }
+
+    /**
      * 推送"命令待确认"事件
      * <p>
      * 命令记录已经用独立事务提交，前端收到事件后可立即渲染确认卡片并调用确认接口。

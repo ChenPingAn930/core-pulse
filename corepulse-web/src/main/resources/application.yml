@@ -33,11 +33,19 @@ spring:
     time-zone: Asia/Shanghai
   # ==================== LLM 配置（OpenAI 协议兼容厂商） ====================
 corepulse:
+  # ==================== 终端命令确认配置 ====================
+  # confirm-timeout：待确认命令的有效期。用户在这个时间内没点确认，记录会被置为 EXPIRED（未执行、不可再执行）。
+  # 调得太短会让用户边查资料边确认时卡片突然失效，调得太长则长期占着模型的上下文。
+  command:
+    confirm-timeout: 5m
+    # sweep-interval-ms：过期扫描间隔（毫秒），只影响卡片何时自动变成"已超时"，确认接口本身是实时判定的。
+    # 必须是纯数字毫秒：@Scheduled 的 fixedDelayString 不认 "60s" 这种简写，会直接导致启动失败
+    sweep-interval-ms: 60000
   llm:
     primary:
-      base-url: https://token.sensenova.cn
-      api-key: ${SENSENOVA_API_KEY}
-      model: sensenova-6.8-flash-lite
+      base-url: https://api-inference.modelscope.cn #https://token.sensenova.cn
+      api-key: ${modelscope_API_KEY} #modelscope，SENSENOVA_API_KEY
+      model: deepseek-ai/DeepSeek-V4.1-Flash-1017 #deepseek-ai/DeepSeek-V4.1-Flash-1017，sensenova-6.8-flash-lite
       temperature: 0.7
     backup:
       base-url: https://api.deepseek.com

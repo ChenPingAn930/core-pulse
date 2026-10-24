@@ -17,7 +17,7 @@ import lombok.Data;
 @Builder
 public class CommandStatusVO {
 
-    /** 状态值：PENDING / CONFIRMED / EXECUTING / EXECUTED / FAILED */
+    /** 状态值：PENDING / CONFIRMED / EXECUTING / EXECUTED / FAILED / EXPIRED（超时未执行） */
     private String status;
 
     /** 命令原文：前端可用它校正被 WS 事件覆盖前的卡片内容 */

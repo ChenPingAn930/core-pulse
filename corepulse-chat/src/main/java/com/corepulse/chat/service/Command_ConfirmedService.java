@@ -8,10 +8,13 @@ import com.corepulse.chat.model.vo.CommandStatusVO;
 public interface Command_ConfirmedService {
 
     /**
-     * 确认一条待执行命令，并触发新一轮对话让模型真正执行它
+     * 确认一条待执行命令。
+     * <p>
+     * 用户点确认后由后端抢占执行权并异步执行，不再经由模型二次调用工具：
+     * 用户确认过的动作必须确定性执行，不能依赖 LLM 是否愿意再调一次工具。
      *
      * @param messageid 待确认命令的消息 ID（t_chat_message.id）
-     * @return 给前端展示的结果文本
+     * @return 给前端展示的结果文本（执行结果通过 WebSocket / 状态查询接口回传）
      */
     String Command_Confirmed(String messageid);
 

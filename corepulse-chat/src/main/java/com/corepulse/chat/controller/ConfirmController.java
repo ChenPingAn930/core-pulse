@@ -1,11 +1,15 @@
 package com.corepulse.chat.controller;
 
 import com.corepulse.chat.model.vo.CommandStatusVO;
+import com.corepulse.chat.model.vo.PendingCommandVO;
+import com.corepulse.chat.service.CommandPendingService;
 import com.corepulse.chat.service.Command_ConfirmedService;
 import com.corepulse.common.result.ApiResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
 
 @Slf4j
 @RestController
@@ -14,6 +18,31 @@ public class ConfirmController {
 
     @Autowired
     Command_ConfirmedService command_ConfirmedService;
+
+    @Autowired
+    CommandPendingService commandPendingService;
+
+    /**
+     * 查询会话内仍然有效的待确认命令（卡片兜底通道）
+     * <p>
+     * 为什么需要它：确认卡片现在只靠 WebSocket 事件渲染，页面刷新、断线重连、
+     * 推送失败都会让卡片永久消失，而对话正文里还留着"请在卡片上确认"的文字。
+     * 前端进入会话时拉一次这个接口，就能把漏掉的卡片补齐。
+     * <p>
+     * 已过期的记录不会被返回（服务端会顺手把它们收敛成 EXPIRED）。
+     *
+     * @param sessionId 会话 ID
+     * @return 待确认命令列表，可能为空
+     */
+    @GetMapping("/pending")
+    public ApiResponse<List<PendingCommandVO>> listPending(@RequestParam Long sessionId) {
+        // 控制器没有事务，这里的 UPDATE 是自动提交的（锁只持有毫秒级），可以放心先收敛再过期过滤；
+        // listValidPending 本身只读，不能在长事务里做这个 UPDATE
+        commandPendingService.expireTimeoutOfSession(sessionId);
+        List<PendingCommandVO> pending = commandPendingService.listValidPending(sessionId);
+        log.info("查询待确认命令: sessionId={}, count={}", sessionId, pending.size());
+        return ApiResponse.ok(pending);
+    }
 
     @PostMapping("/{messageid}")
     public ApiResponse<String> Command_Confirmed(@PathVariable String messageid) {

@@ -39,11 +39,23 @@ CREATE TABLE `t_chat_message` (
   `task_id` bigint unsigned DEFAULT NULL,
   `extra` json DEFAULT NULL,
   `confirmed` tinyint(1) NOT NULL DEFAULT 0 COMMENT '是否已确认：0-否 1-是',
-  `status` varchar(20) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '命令确认状态：PENDING/CONFIRMED/EXECUTED，普通消息为 NULL',
+  `status` varchar(20) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '命令确认状态：PENDING/CONFIRMED/EXECUTING/EXECUTED/FAILED/EXPIRED，普通消息为 NULL',
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  KEY `idx_session` (`session_id`,`created_at`)
+  KEY `idx_session` (`session_id`,`created_at`),
+  KEY `idx_status_created` (`status`,`created_at`)
 ) ENGINE=InnoDB AUTO_INCREMENT=987 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='聊天消息表';
+
+-- ---------------------------------------------------------------------------
+-- 已有库升级语句（新库直接建表即可，无需执行；EXPIRED 为超时失效终态）
+-- ---------------------------------------------------------------------------
+-- ALTER TABLE `t_chat_message`
+--     MODIFY COLUMN `status` varchar(20) COLLATE utf8mb4_unicode_ci DEFAULT NULL
+--         COMMENT '命令确认状态：PENDING/CONFIRMED/EXECUTING/EXECUTED/FAILED/EXPIRED，普通消息为 NULL',
+--     ADD KEY `idx_status_created` (`status`,`created_at`);
+-- 历史遗留的待确认记录直接收敛为 EXPIRED，避免升级后继续阻塞对话上下文
+-- UPDATE `t_chat_message` SET `status` = 'EXPIRED'
+--  WHERE `status` = 'PENDING' AND `created_at` < NOW() - INTERVAL 5 MINUTE;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --

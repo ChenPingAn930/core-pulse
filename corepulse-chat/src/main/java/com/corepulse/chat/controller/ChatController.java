@@ -2,7 +2,7 @@ package com.corepulse.chat.controller;
 
 import com.corepulse.chat.model.dto.ChatSendRequest;
 import com.corepulse.chat.model.vo.ChatSendVO;
-import com.corepulse.chat.service.ChatService;
+import com.corepulse.chat.service.SessionChatDispatcher;
 import com.corepulse.common.result.ApiResponse;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -19,14 +19,18 @@ import org.springframework.web.bind.annotation.RestController;
 @RequiredArgsConstructor
 public class ChatController {
 
-    private final ChatService chatService;
+    /**
+     * 注入调度器而不是 ChatService：所有 LLM 推理必须经过会话锁，
+     * 否则用户消息与后台播报会并发写同一个会话
+     */
+    private final SessionChatDispatcher chatDispatcher;
 
     /**
      * 发送消息 - AI 对话
      */
     @PostMapping("/send")
     public ApiResponse<ChatSendVO> send(@Valid @RequestBody ChatSendRequest request) {
-        return ApiResponse.ok(chatService.send(request));
+        return ApiResponse.ok(chatDispatcher.send(request));
     }
 
     /**
@@ -34,6 +38,6 @@ public class ChatController {
      */
     @PostMapping("/message")
     public ApiResponse<ChatSendVO> message(@Valid @RequestBody ChatSendRequest request) {
-        return ApiResponse.ok(chatService.send(request));
+        return ApiResponse.ok(chatDispatcher.send(request));
     }
 }
