@@ -104,6 +104,13 @@ public class ChatServiceImpl implements ChatService {
         Long sessionId = request.getSessionId();
         String content = request.getContent();
 
+        // 0. 是否"系统触发的轮次"（当前只有命令结果播报，source=command-result）
+        // 这类轮次的 content 是后端自己拼的通知文本，不是用户的原话；
+        // 一旦让后面的意图识别/仲裁跑在它身上，路径里的英文单词就会被当成用户意图
+        // （真实事故：命令路径里的 uninstall 目录名命中"uninstall"，被判定成"用户要卸载软件"）
+        // 只认白名单常量而不是"source 非空"：source 来自请求体，任何非空值都能被当成系统触发
+        boolean systemTriggered = ChatSendRequest.SOURCE_COMMAND_RESULT.equals(request.getSource());
+
         // 1. 获取/创建会话
         ChatSession session = sessionService.getOrCreate(sessionId);
 
@@ -126,7 +133,9 @@ public class ChatServiceImpl implements ChatService {
         chatEventPublisher.publishThinking(session.getId(), "思考中");
 
         // 5. 构建上下文消息（传入用户消息用于重装意图检测）
-        List<Message> messages = buildMessages(session.getId(), content);
+        // 系统触发的轮次跳过意图引导注入：播报只需要如实陈述"命令执行结果"，
+        // 注入"卸载残留校验/磁盘清理"等引导反而会让模型在播报里继续规划下一步操作
+        List<Message> messages = buildMessages(session.getId(), content, systemTriggered);
 
         // 6. 调用 LLM（注入工具上下文：sessionId 供工具方法使用，不暴露给 LLM 参数）
         // 同时把会话 ID 写入 RecordingToolCallingManager 的 ThreadLocal，供工具执行期间推送过程事件
@@ -225,46 +234,61 @@ public class ChatServiceImpl implements ChatService {
             reply = "我已经处理了你的请求，但没能生成合适的回复，请再试一次。";
         }
 
-        // 6.5 卸载残留校验仲裁：模型声称"卸载干净"但本轮没调用 verifyUninstallApp → 强制补验
-        // 原理：残留目录名往往和软件名无关，模型按软件名 dir 搜不到就"背稿"说干净。
-        // 后端只认"verifyUninstallApp 真被调用过 + 其返回 JSON 的 clean"，防止假验收。
-        boolean isUninstallIntent = hasUninstallIntent(request.getContent());
-        boolean claimsClean = isUninstallIntent && CLAIM_CLEAN_WORDS.stream().anyMatch(reply::contains);
-        boolean verified = invokedTools.stream().anyMatch(t -> t.startsWith("verifyUninstallApp"));
-        if (isUninstallIntent && claimsClean && !verified) {
-            log.warn("[卸载校验拦截] 会话 {} 声称卸载干净但未调用 verifyUninstallApp，已代跑", session.getId());
-            String verifyJson = tryRunVerify(request.getContent(), session.getId());
-            reply = "本轮缺少卸载后校验，已由系统代为执行 verifyUninstallApp，结果如下：\n" + verifyJson
-                    + "\n（请确认并告知用户：clean 为 false 时残留清单见上，是否清理请征得用户同意。）";
-        }
+        // 6.5/6.6 两段仲裁只对"用户亲手发起的轮次"生效。
+        // 为什么系统触发轮次必须豁免：
+        // 1) 它的 content 是后端拼的通知文本（含命令原文），路径里的 uninstall / delete 会被
+        //    意图关键词命中，得出"用户要卸载软件"的错误前提；
+        // 2) 它要表达的事实只是"这条命令执行成功了"，模型说"已卸载成功"属于如实复述，
+        //    不是"没做校验就宣称干净"；
+        // 3) 一旦照旧仲裁，用户看到的就不是模型的说明，而是一段 verifyUninstallApp 的 JSON
+        //    （真实事故：435 字回复被整段替换，回复内容与用户操作完全对不上）。
+        if (systemTriggered) {
+            log.info("会话 {} 系统触发轮次(source={}), 跳过卸载校验与确认卡片仲裁",
+                    session.getId(), request.getSource());
+        } else {
+            // 6.5 卸载残留校验仲裁：模型声称"卸载干净"但本轮没调用 verifyUninstallApp → 强制补验
+            // 原理：残留目录名往往和软件名无关，模型按软件名 dir 搜不到就"背稿"说干净。
+            // 后端只认"verifyUninstallApp 真被调用过 + 其返回 JSON 的 clean"，防止假验收。
+            boolean isUninstallIntent = hasUninstallIntent(request.getContent());
+            boolean claimsClean = isUninstallIntent && CLAIM_CLEAN_WORDS.stream().anyMatch(reply::contains);
+            boolean verified = invokedTools.stream().anyMatch(t -> t.startsWith("verifyUninstallApp"));
+            if (isUninstallIntent && claimsClean && !verified) {
+                log.warn("[卸载校验拦截] 会话 {} 声称卸载干净但未调用 verifyUninstallApp，已代跑", session.getId());
+                String verifyJson = tryRunVerify(request.getContent(), session.getId());
+                reply = "本轮缺少卸载后校验，已由系统代为执行 verifyUninstallApp，结果如下：\n" + verifyJson
+                        + "\n（请确认并告知用户：clean 为 false 时残留清单见上，是否清理请征得用户同意。）";
+            }
 
-        // 6.6 确认卡片存在性仲裁：模型回复里说"需要用户确认"，但库里没有有效待确认记录 → 它在背稿
-        // 原理：PromptEnum 里教过它确认文案，模型完全可以不调工具、直接复述这句话，
-        // 用户照着提示去点卡片却发现根本没有卡片。这里只做"是否存在"的校验，
-        // 绝不从回复文本里反推命令自动补建记录 —— 那会造成"用户确认 A、实际执行 B"的新漏洞。
-        String confirmClaim = CONFIRM_CLAIM_MARKERS.stream()
-                .filter(reply::contains)
-                .findFirst()
-                .orElse(null);
-        if (confirmClaim != null) {
-            // 两个信号缺一不可地"或"起来，是因为它们各自会漏：
-            // 1. confirmationRequested —— 本轮工具真实返回过"需要用户确认"，内存信号，不受事务可见性影响；
-            // 2. hasValidPending —— 库里确实存在有效记录，能覆盖"引用上一轮旧卡片"的场景。
-            // 为什么要两个都看：send() 在事务里（REPEATABLE READ），快照在 buildMessages 首次查询时就固定了；
-            // 而待确认记录是本轮用 REQUIRES_NEW 另开事务插进去的，对本事务的快照不可见，
-            // 只查库会得出"没有卡片"的错误结论，把明明已经弹出卡片的一轮改成"提交失败"
-            boolean cardExists = confirmationRequested || commandPendingService.hasValidPending(session.getId());
-            if (!cardExists) {
-                log.warn("[确认卡片拦截] 会话 {} 回复声称需要确认(命中措辞:{}), 但本轮无确认返回且库中无有效记录",
-                        session.getId(), confirmClaim);
-                reply = "这条命令没有真正提交到系统，因此界面上不会出现确认卡片，我也不会执行它。"
-                        + "请重新发送一次指令，我会重新提交执行申请，再由你在卡片上确认。";
+            // 6.6 确认卡片存在性仲裁：模型回复里说"需要用户确认"，但库里没有有效待确认记录 → 它在背稿
+            // 原理：PromptEnum 里教过它确认文案，模型完全可以不调工具、直接复述这句话，
+            // 用户照着提示去点卡片却发现根本没有卡片。这里只做"是否存在"的校验，
+            // 绝不从回复文本里反推命令自动补建记录 —— 那会造成"用户确认 A、实际执行 B"的新漏洞。
+            String confirmClaim = CONFIRM_CLAIM_MARKERS.stream()
+                    .filter(reply::contains)
+                    .findFirst()
+                    .orElse(null);
+            if (confirmClaim != null) {
+                // 两个信号缺一不可地"或"起来，是因为它们各自会漏：
+                // 1. confirmationRequested —— 本轮工具真实返回过"需要用户确认"，内存信号，不受事务可见性影响；
+                // 2. hasValidPending —— 库里确实存在有效记录，能覆盖"引用上一轮旧卡片"的场景。
+                // 为什么要两个都看：send() 在事务里（REPEATABLE READ），快照在 buildMessages 首次查询时就固定了；
+                // 而待确认记录是本轮用 REQUIRES_NEW 另开事务插进去的，对本事务的快照不可见，
+                // 只查库会得出"没有卡片"的错误结论，把明明已经弹出卡片的一轮改成"提交失败"
+                boolean cardExists = confirmationRequested || commandPendingService.hasValidPending(session.getId());
+                if (!cardExists) {
+                    log.warn("[确认卡片拦截] 会话 {} 回复声称需要确认(命中措辞:{}), 但本轮无确认返回且库中无有效记录",
+                            session.getId(), confirmClaim);
+                    reply = "这条命令没有真正提交到系统，因此界面上不会出现确认卡片，我也不会执行它。"
+                            + "请重新发送一次指令，我会重新提交执行申请，再由你在卡片上确认。";
+                }
             }
         }
 
         // 7. 保存 AI 回复
-        saveMessage(session.getId(), MessageRole.ASSISTANT.getValue(), reply, null, null);
-        log.info("会话 {} 回复完成, replyLen={}", session.getId(), reply.length());
+        // 消息 ID 一并返回：播报轮要靠 WebSocket 推这条回复，带上 ID 前端才能去重/补拉，
+        // 否则补推机制会让同一句话出现两遍
+        Long replyMessageId = saveMessage(session.getId(), MessageRole.ASSISTANT.getValue(), reply, null, null);
+        log.info("会话 {} 回复完成, replyLen={}, messageId={}", session.getId(), reply.length(), replyMessageId);
 
         // 8. 摘要只处理上次游标之后的消息；摘要失败时不推进游标
         //    【修复 2026-08-25】改用 session.getId()（始终非空，line 79 已创建/获取会话）代替
@@ -288,6 +312,7 @@ public class ChatServiceImpl implements ChatService {
             return ChatSendVO.builder()
                     .sessionId(session.getId())
                     .reply(reply)
+                    .replyMessageId(replyMessageId)
                     .taskId(null)
                     .build();
         }
@@ -359,6 +384,7 @@ public class ChatServiceImpl implements ChatService {
         return ChatSendVO.builder()
                 .sessionId(session.getId())
                 .reply(reply)
+                .replyMessageId(replyMessageId)
                 .taskId(null)
                 .build();
     }
@@ -406,49 +432,57 @@ public class ChatServiceImpl implements ChatService {
      *
      * @param sessionId 会话 ID，用于查询该会话的历史消息
      * @param userContent 当前用户消息内容，用于意图检测
+     * @param skipIntentGuides 是否跳过 RAG 检索与意图引导（系统触发的轮次为 true）
      * @return 组装好的 Spring AI Message 列表
      */
-    private List<Message> buildMessages(Long sessionId, String userContent) {
+    private List<Message> buildMessages(Long sessionId, String userContent, boolean skipIntentGuides) {
         // 构建消息列表
         List<Message> messages = new ArrayList<>();
 
         // 系统提示
         messages.add(new SystemMessage(PromptEnum.SYSTEM_DEFAULT.getContent()));
 
-        // RAG：检索个人知识库，命中则注入相关知识片段，辅助诊断
-        // topK=5 提高硬件操作细节(如 4.1 内存拔插)被命中的概率，避免只命中概览块而丢失安全细节
-        // 短确认消息（可以/好的/继续等）跳过检索，避免无关片段注入上下文干扰模型
-        if (!isShortConfirmation(userContent)) {
-            List<String> knowledge = knowledgeService.search(userContent, 5);
-            if (!knowledge.isEmpty()) {
-                // 组装知识片段为系统提示
-                messages.add(new SystemMessage(buildKnowledgePrompt(knowledge)));
+        if (skipIntentGuides) {
+            // 系统触发轮次（如命令结果播报）：这一轮只有一件事要做——如实说明命令执行结果。
+            // 检索与意图引导本质上都是"猜用户想干什么"，拿后端自造的通知文本去猜必然跑偏：
+            // 本次事故里正是通知中的命令路径命中"卸载"意图，模型被引导去继续规划下一台机器的卸载。
+            log.info("会话 {} 系统触发轮次，跳过 RAG 检索与意图引导注入", sessionId);
+        } else {
+            // RAG：检索个人知识库，命中则注入相关知识片段，辅助诊断
+            // topK=5 提高硬件操作细节(如 4.1 内存拔插)被命中的概率，避免只命中概览块而丢失安全细节
+            // 短确认消息（可以/好的/继续等）跳过检索，避免无关片段注入上下文干扰模型
+            if (!isShortConfirmation(userContent)) {
+                List<String> knowledge = knowledgeService.search(userContent, 5);
+                if (!knowledge.isEmpty()) {
+                    // 组装知识片段为系统提示
+                    messages.add(new SystemMessage(buildKnowledgePrompt(knowledge)));
+                }
             }
-        }
 
-        // 重装系统意图检测：命中则注入图文引导
-        if (hasReinstallIntent(userContent)) {
-            messages.add(new SystemMessage(buildReinstallGuide()));
-        }
+            // 重装系统意图检测：命中则注入图文引导
+            if (hasReinstallIntent(userContent)) {
+                messages.add(new SystemMessage(buildReinstallGuide()));
+            }
 
-        // 卸载意图检测：命中则注入卸载残留校验引导（按需注入，避免常驻 SYSTEM_DEFAULT 撑爆上下文）
-        if (hasUninstallIntent(userContent)) {
-            messages.add(new SystemMessage(FeatureGuideEnum.UNINSTALL.getContent()));
-        }
+            // 卸载意图检测：命中则注入卸载残留校验引导（按需注入，避免常驻 SYSTEM_DEFAULT 撑爆上下文）
+            if (hasUninstallIntent(userContent)) {
+                messages.add(new SystemMessage(FeatureGuideEnum.UNINSTALL.getContent()));
+            }
 
-        // 磁盘清理意图检测：命中则注入磁盘清理专项引导
-        if (hasDiskCleanIntent(userContent)) {
-            messages.add(new SystemMessage(FeatureGuideEnum.DISK_CLEAN.getContent()));
-        }
+            // 磁盘清理意图检测：命中则注入磁盘清理专项引导
+            if (hasDiskCleanIntent(userContent)) {
+                messages.add(new SystemMessage(FeatureGuideEnum.DISK_CLEAN.getContent()));
+            }
 
-        // 运行库修复意图检测：命中则注入运行库专项引导
-        if (hasVcRedistIntent(userContent)) {
-            messages.add(new SystemMessage(FeatureGuideEnum.VCREDIST.getContent()));
-        }
+            // 运行库修复意图检测：命中则注入运行库专项引导
+            if (hasVcRedistIntent(userContent)) {
+                messages.add(new SystemMessage(FeatureGuideEnum.VCREDIST.getContent()));
+            }
 
-        // 压力测试意图检测：命中则注入压测专项引导
-        if (hasStressIntent(userContent)) {
-            messages.add(new SystemMessage(FeatureGuideEnum.STRESS.getContent()));
+            // 压力测试意图检测：命中则注入压测专项引导
+            if (hasStressIntent(userContent)) {
+                messages.add(new SystemMessage(FeatureGuideEnum.STRESS.getContent()));
+            }
         }
 
         /* 历史消息（最近 MAX_HISTORY 条，按 ID 正序）*/
@@ -758,8 +792,13 @@ public class ChatServiceImpl implements ChatService {
     /**
      * 后端仲裁：代跑 verifyUninstallApp 补验。
      * <p>
-     * 从用户消息中提取软件名（appName）作为入参；提取不到时用整条消息兜底。
+     * 从用户消息中提取软件名（appName）作为入参；提取不到可信名字时放弃本次校验。
      * 只读校验，不删除任何文件。
+     * <p>
+     * 为什么提取失败要放弃而不是"用整条消息兜底"：兜底会把一整段指令当成软件名交给
+     * 校验工具去枚举目录，结果是一份"看起来校验过、其实什么都没查"的 JSON，
+     * 还会把脏文本原样展示给用户（曾出现 app 字段是一整段系统通知的情况）。
+     * 校验的价值在于结论可信，宁可明确说"没验"，也不要伪造一份结论。
      *
      * @param userContent 用户消息内容
      * @param sessionId   会话 ID
@@ -767,6 +806,11 @@ public class ChatServiceImpl implements ChatService {
      */
     private String tryRunVerify(String userContent, Long sessionId) {
         String appName = extractAppName(userContent);
+        if (appName.isBlank()) {
+            log.warn("会话 {} 未能从消息中提取可信软件名，跳过卸载残留补验", sessionId);
+            return "{\"app\":\"\",\"hasSnapshot\":false,\"clean\":false,"
+                    + "\"note\":\"未能从消息中识别出软件名，本次未执行残留校验，请先与用户确认软件名称后重新核验\"}";
+        }
         try {
             return uninstallVerifyToolkit.verifyUninstallApp(appName, null);
         } catch (Exception e) {
@@ -779,11 +823,13 @@ public class ChatServiceImpl implements ChatService {
     /**
      * 从用户消息中提取软件名（appName）。
      * <p>
-     * 规则：定位"卸载/删除/删掉/卸掉"等关键词，取其后紧跟的一段非空白文本作为软件名；
-     * 若关键词后无有效内容，则返回整条消息（trim 后）作为兜底。
+     * 规则：定位"卸载/删除/删掉/卸掉"等关键词，取其后紧跟的一段文本作为候选，再交给
+     * {@link #sanitizeAppName(String)} 校验。关键词后面经常不是软件名，而是一整段命令或说明
+     * （例如系统通知里的 ".../uninstall/helper.exe" /S 执行结果：成功..."），
+     * 直接当软件名用会把校验跑成垃圾数据。
      *
      * @param content 用户消息内容
-     * @return 提取到的软件名
+     * @return 提取到且通过校验的软件名；不可信时返回空串
      */
     private String extractAppName(String content) {
         if (content == null || content.isBlank()) {
@@ -798,11 +844,49 @@ public class ChatServiceImpl implements ChatService {
                 // 去掉结尾的标点/语气词，取第一段
                 after = after.replaceAll("[。！？!?，,、\\s]+$", "");
                 if (!after.isBlank()) {
-                    return after;
+                    return sanitizeAppName(after);
                 }
             }
         }
-        return trimmed;
+        return sanitizeAppName(trimmed);
+    }
+
+    /**
+     * 校验并清洗候选软件名
+     * <p>
+     * 判据只保留"像一个软件名"的形态：单行、长度合理、不含路径分隔符与命令开关、
+     * 不是说明性长句。宁可返回空串让上层放弃校验，也不把命令行片段当软件名。
+     *
+     * @param candidate 关键词之后截出的候选文本
+     * @return 可信的软件名；不可信返回空串
+     */
+    private String sanitizeAppName(String candidate) {
+        if (candidate == null) {
+            return "";
+        }
+        // 软件名不会跨行：只取第一行非空内容，避免把后续的"执行结果/输出摘要"一起带走
+        String name = candidate.lines()
+                .map(String::trim)
+                .filter(line -> !line.isEmpty())
+                .findFirst()
+                .orElse("")
+                .replace("\"", "")
+                .trim();
+        if (name.isEmpty() || name.length() > 40) {
+            return "";
+        }
+        // 命令片段特征：路径分隔符 / 命令行开关 / 盘符路径
+        if (name.contains("/") || name.contains("\\")) {
+            return "";
+        }
+        if (name.matches("^[A-Za-z]:.*")) {
+            return "";
+        }
+        // 说明性长句特征：软件名里不会出现成句标点
+        if (name.contains("：") || name.contains("。")) {
+            return "";
+        }
+        return name;
     }
 
     /**

@@ -8,6 +8,7 @@ import com.corepulse.chat.model.vo.SessionVO;
 import com.corepulse.chat.service.SessionService;
 import com.corepulse.domain.entity.ChatMessage;
 import com.corepulse.domain.entity.ChatSession;
+import com.corepulse.domain.enums.MessageRole;
 import com.corepulse.domain.mapper.ChatMessageMapper;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -95,6 +96,15 @@ public class SessionServiceImpl implements SessionService {
                 new Page<>(page, size),
                 new LambdaQueryWrapper<ChatMessage>()
                         .eq(ChatMessage::getSessionId, sessionId)
+                        // 只返回"给人看"的消息：对话内容 + 待确认/已执行命令记录。
+                        // role=tool 且 status 为空的记录是工具原始输出（dir/tasklist 列表、
+                        // 卸载校验 JSON、退出码等），它们是给模型拼上下文用的，
+                        // 返回给前端只会在界面上堆出一屏没人看的文本。
+                        // 注意：模型上下文走 ChatServiceImpl.buildMessages 直接查库，不受此处影响；
+                        // 在 SQL 侧过滤而不是查完再删，分页条数才不会被大量无用记录稀释
+                        .and(w -> w.ne(ChatMessage::getRole, MessageRole.TOOL.getValue())
+                                .or()
+                                .isNotNull(ChatMessage::getStatus))
                         .orderByAsc(ChatMessage::getId));
 
         List<MessageVO> list = p.getRecords().stream().map(m ->

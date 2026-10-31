@@ -66,21 +66,22 @@ public class WebSocketChatEventPublisher implements ChatEventPublisher, CommandC
      * 否则同一句话会在界面上出现两次。
      */
     @Override
-    public void publishAssistantReply(Long sessionId, String content) {
+    public void publishAssistantReply(Long sessionId, Long messageId, String content) {
         if (sessionId == null || content == null || content.isBlank()) {
             return;
         }
         Map<String, Object> event = new LinkedHashMap<>();
         event.put("type", "assistant_reply");
         event.put("sessionId", sessionId);
+        // 带上消息 ID：前端可以据此去重（补推时不重复渲染），也为断线后按 ID 补拉留好契约。
+        // 旧版前端会忽略这个新字段，因此向后兼容
+        event.put("messageId", messageId);
         event.put("content", content);
-        boolean sent = sessionManager.send(sessionId, event);
-        if (!sent) {
-            // 推不出去时把事实写清楚：回复已经入库，前端刷新/重新拉历史能看到，
-            // 但实时推送这一帧丢了。没有这行日志，"后端说推了、用户说没收到"只能靠猜
-            log.warn("助手回复未能实时推送(已入库, 刷新可见): sessionId={}, replyLen={}",
-                    sessionId, content.length());
-        }
+        // 发送失败不丢弃：交给 sessionManager 缓冲，前端下次建连时补推。
+        // 这条事件没有 HTTP 响应承接，也没有历史轮询兜底，丢了就只能刷新
+        sessionManager.sendOrBuffer(sessionId, event);
+        log.info("助手回复已提交推送: sessionId={}, messageId={}, replyLen={}",
+                sessionId, messageId, content.length());
     }
 
     /**

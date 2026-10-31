@@ -30,6 +30,9 @@ public class ChatController {
      */
     @PostMapping("/send")
     public ApiResponse<ChatSendVO> send(@Valid @RequestBody ChatSendRequest request) {
+        // source 是后端内部信任标记（决定是否豁免意图识别与仲裁），外部请求一律清空，
+        // 否则调用方自己传一个 source 就能让后端跳过校验
+        request.setSource(null);
         return ApiResponse.ok(chatDispatcher.send(request));
     }
 
@@ -38,6 +41,7 @@ public class ChatController {
      */
     @PostMapping("/message")
     public ApiResponse<ChatSendVO> message(@Valid @RequestBody ChatSendRequest request) {
+        request.setSource(null);
         return ApiResponse.ok(chatDispatcher.send(request));
     }
 }

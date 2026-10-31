@@ -80,7 +80,9 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
         Long chatSessionId = parseSessionId(session.getUri());
         if (chatSessionId != null) {
-            sessionManager.remove(chatSessionId);
+            // 必须带上原始连接 ID：页面刷新/重连时，旧连接的关闭回调可能晚于新连接注册，
+            // 只按会话 ID 无条件删除会把刚注册的新连接一起删掉，之后所有推送都发不出去
+            sessionManager.remove(chatSessionId, session.getId());
         }
     }
     // 从 URI 中解析 sessionId

@@ -28,7 +28,7 @@ public class CommandResultNoticeService {
     private static final long NOTICE_WAIT_SECONDS = 30;
 
     /** 播报轮次的来源标记：入库到 extra.source，前端据此不把它渲染成用户气泡 */
-    private static final String SOURCE_COMMAND_RESULT = "command-result";
+    private static final String SOURCE_COMMAND_RESULT = ChatSendRequest.SOURCE_COMMAND_RESULT;
 
     private final SessionChatDispatcher sessionChatDispatcher;
 
@@ -54,9 +54,12 @@ public class CommandResultNoticeService {
         if (vo == null || vo.getReply() == null || vo.getReply().isBlank()) {
             return;
         }
-        // 这一步没有 HTTP 响应承接回复，必须走 WebSocket，否则用户看不到模型说了什么
-        chatEventPublisher.publishAssistantReply(sessionId, vo.getReply());
-        log.info("命令结果播报完成: sessionId={}, replyLen={}", sessionId, vo.getReply().length());
+        // 这一步没有 HTTP 响应承接回复，必须走 WebSocket，否则用户看不到模型说了什么。
+        // 一并带上回复的消息 ID：推不出去时推送器会缓冲并在前端重连后补推，
+        // 前端凭 ID 去重，不会因为补推把同一句话显示两遍
+        chatEventPublisher.publishAssistantReply(sessionId, vo.getReplyMessageId(), vo.getReply());
+        log.info("命令结果播报完成: sessionId={}, replyLen={}, messageId={}",
+                sessionId, vo.getReply().length(), vo.getReplyMessageId());
     }
 
     /**

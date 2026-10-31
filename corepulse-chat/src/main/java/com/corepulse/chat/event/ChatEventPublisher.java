@@ -42,7 +42,8 @@ public interface ChatEventPublisher {
      * 不推这条事件，用户就看不到模型说了什么，只能刷新页面重新拉历史。
      *
      * @param sessionId 会话 ID
+     * @param messageId 回复在 t_chat_message 中的 ID（前端据此去重/补拉，可为 null）
      * @param content   助手回复正文
      */
-    void publishAssistantReply(Long sessionId, String content);
+    void publishAssistantReply(Long sessionId, Long messageId, String content);
 }
